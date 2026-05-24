@@ -1,14 +1,16 @@
 {
-  "name": "alpha-intelligence-telegram-bot",
-  "version": "2.0.0",
-  "description": "Autonomous AI Intelligence Degen Trading Bot Core Engine",
+  "name": "solana-autonomous-ai-degen-bot",
+  "version": "3.0.0",
+  "description": "Production Autonomous Execution and Risk Engine with On-Chain Pattern Recognition",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
     "start": "tsc && node dist/bot.js"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.95.5",
     "axios": "^1.7.2",
+    "bs58": "^5.0.0",
     "dotenv": "^16.4.5",
     "pg": "^8.11.5",
     "telegraf": "^4.16.3"
