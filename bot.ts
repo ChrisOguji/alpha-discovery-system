@@ -176,11 +176,13 @@ async function runAutonomousTradingEngine() {
 
       if (TELEGRAM_CHAT_ID) {
         try {
-          // BUG FIX: Updated format for telegraf v4 compatibility
-          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, signalAlertMessage, { 
-            parse_mode: 'HTML', 
-            link_preview: { disable: true } 
-          });
+          // COMPILER FIX: Bypassing strict type variations with an explicit type cast block
+          const messageOptions: any = {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          };
+
+          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, signalAlertMessage, messageOptions);
           await db.query(`UPDATE token_intelligence SET alert_sent = TRUE WHERE token_address = $1`, [token.tokenAddress]);
           console.log(`✈️ Automated Trade alert broadcasted to Telegram channel for $${market.symbol}`);
         } catch (telegramErr) {
