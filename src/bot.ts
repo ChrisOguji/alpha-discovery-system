@@ -88,40 +88,61 @@ function evaluatedLoreUniqueness(tokenAddress: string, description: string): boo
   return wordCount >= minimumLoreWordLength;
 }
 
-// 5. JUPITER AUTOMATED EXECUTION ENGINE PIPELINE (SWAP EXECUTOR)
+// 5. HARDENED JUPITER AUTOMATED EXECUTION ENGINE WITH DNS RETRY INFRASTRUCTURE
 async function executeJupiterSwap(inputMint: string, outputMint: string, lamportsAmount: number): Promise<{ txid: string; priceUsd: number } | null> {
   if (!fundingWallet) return null;
-  try {
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${lamportsAmount}&slippageBps=150`;
-    const quoteRes = await axios.get(quoteUrl);
-    const quoteResponse = quoteRes.data;
 
-    if (!quoteResponse) return null;
+  // List of geo-distributed API fallback endpoints to handle ENOTFOUND/IP bans seamlessly
+  const jupEndpoints = [
+    `https://quote-api.jup.ag/v6`,
+    `https://api.jup.ag/v6`
+  ];
 
-    const swapRes = await axios.post('https://quote-api.jup.ag/v6/swap', {
-      quoteResponse,
-      userPublicKey: fundingWallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-    });
+  const maxRetries = 3;
 
-    const { swapTransaction } = swapRes.data;
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    // Cycles through available endpoints if one fails
+    const baseApi = jupEndpoints[(attempt - 1) % jupEndpoints.length];
     
-    transaction.sign([fundingWallet]);
-    
-    const txid = await connection.sendTransaction(transaction, { skipPreflight: false, preflightCommitment: 'confirmed' });
-    console.log(`⚡ Jupiter Auto-Trade Dispatched. Signature: ${txid}`);
-    
-    const outPriceEst = parseFloat(quoteResponse.outAmount) / Math.pow(10, 9);
-    const inPriceEst = lamportsAmount / Math.pow(10, 9);
-    const fallbackEntryPriceUsd = inPriceEst > 0 ? (inPriceEst / outPriceEst) * 145 : 0.00001;
+    try {
+      const quoteUrl = `${baseApi}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${lamportsAmount}&slippageBps=150`;
+      const quoteRes = await axios.get(quoteUrl, { timeout: 8000 }); // Strict timeout prevents hanging requests
+      const quoteResponse = quoteRes.data;
 
-    return { txid, priceUsd: fallbackEntryPriceUsd };
-  } catch (error) {
-    console.error(`❌ Jupiter Auto-Buy Pipeline Failed for ${outputMint}:`, error);
-    return null;
+      if (!quoteResponse) continue;
+
+      const swapRes = await axios.post(`${baseApi}/swap`, {
+        quoteResponse,
+        userPublicKey: fundingWallet.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+      }, { timeout: 8000 });
+
+      const { swapTransaction } = swapRes.data;
+      const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+      const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+      
+      transaction.sign([fundingWallet]);
+      
+      const txid = await connection.sendTransaction(transaction, { skipPreflight: false, preflightCommitment: 'confirmed' });
+      console.log(`⚡ Jupiter Auto-Trade Dispatched via ${baseApi}. Signature: ${txid}`);
+      
+      const outPriceEst = parseFloat(quoteResponse.outAmount) / Math.pow(10, 9);
+      const inPriceEst = lamportsAmount / Math.pow(10, 9);
+      const fallbackEntryPriceUsd = inPriceEst > 0 ? (inPriceEst / outPriceEst) * 145 : 0.00001;
+
+      return { txid, priceUsd: fallbackEntryPriceUsd };
+    } catch (error: any) {
+      console.warn(`⚠️ Jupiter network connection warning on attempt ${attempt}/${maxRetries} using ${baseApi}: ${error.message || error}`);
+      
+      if (attempt < maxRetries) {
+        // Linear backoff delay before retrying connection
+        await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
+      }
+    }
   }
+
+  console.error(`❌ Critical: All ${maxRetries} Jupiter API gateway attempts exhausted for ${outputMint}. Trade aborted.`);
+  return null;
 }
 
 // 6. TRACKING RISK, HARD STOP-LOSS, & DYNAMIC TAKE-PROFIT CONTROLLER
@@ -141,7 +162,7 @@ async function processActivePositions() {
 
       const currentMultiplier = currentPriceUsd / entryPriceUsd;
 
-      // 🛑 INTEGRATED ADDITION: Hard Stop-Loss Triggered at a 30% Dump (Multiplier <= 0.70)
+      // Stop-Loss Condition: -30% drop threshold (Multiplier <= 0.70)
       if (currentMultiplier <= 0.70) {
         console.log(`🛑 STOP-LOSS TRIGGERED: $${pos.ticker} dropped 30% below entry. Commencing emergency liquidation...`);
         const totalTokensToSell = parseFloat(pos.tokens_held);
@@ -151,7 +172,7 @@ async function processActivePositions() {
         if (sellResult) {
           await db.query('UPDATE token_intelligence SET tokens_held = 0 WHERE token_address = $1', [pos.token_address]);
           await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `🛑 <b>STOP-LOSS LIQUIDATION EXECUTED</b> 🛑\n\nPosition on $${pos.ticker} hit the -30% threshold. Emergency market swap back to SOL complete to protect core capital.\n• Entry Price: $${entryPriceUsd}\n• Exit Price: $${currentPriceUsd}`);
-          continue; // Move immediately to next token position processing
+          continue; 
         }
       }
 
@@ -335,7 +356,7 @@ async function main() {
 
   // Active Monitoring Cycles
   setInterval(scanSolanaTokenProfiles, 1000 * 60 * 3);
-  setInterval(processActivePositions, 1000 * 30); // Checks price drops/surges every 30 seconds
+  setInterval(processActivePositions, 1000 * 30); 
   
   scanSolanaTokenProfiles();
 
