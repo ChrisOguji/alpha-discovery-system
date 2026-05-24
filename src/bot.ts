@@ -92,7 +92,6 @@ function evaluatedLoreUniqueness(tokenAddress: string, description: string): boo
 async function executeJupiterSwap(inputMint: string, outputMint: string, lamportsAmount: number): Promise<{ txid: string; priceUsd: number } | null> {
   if (!fundingWallet) return null;
 
-  // List of geo-distributed API fallback endpoints to handle ENOTFOUND/IP bans seamlessly
   const jupEndpoints = [
     `https://quote-api.jup.ag/v6`,
     `https://api.jup.ag/v6`
@@ -101,12 +100,11 @@ async function executeJupiterSwap(inputMint: string, outputMint: string, lamport
   const maxRetries = 3;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    // Cycles through available endpoints if one fails
     const baseApi = jupEndpoints[(attempt - 1) % jupEndpoints.length];
     
     try {
       const quoteUrl = `${baseApi}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${lamportsAmount}&slippageBps=150`;
-      const quoteRes = await axios.get(quoteUrl, { timeout: 8000 }); // Strict timeout prevents hanging requests
+      const quoteRes = await axios.get(quoteUrl, { timeout: 8000 }); 
       const quoteResponse = quoteRes.data;
 
       if (!quoteResponse) continue;
@@ -135,7 +133,6 @@ async function executeJupiterSwap(inputMint: string, outputMint: string, lamport
       console.warn(`⚠️ Jupiter network connection warning on attempt ${attempt}/${maxRetries} using ${baseApi}: ${error.message || error}`);
       
       if (attempt < maxRetries) {
-        // Linear backoff delay before retrying connection
         await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
       }
     }
@@ -239,16 +236,28 @@ function calculateAlphaMetrics(pairData: any): TokenSignal {
   };
 }
 
-// 8. THE ACTIVE INGESTION & SCANNING LOOP PIPELINE
+// 8. THE UPDATED DUAL-STREAM INGESTION & SCANNING LOOP PIPELINE
 async function scanSolanaTokenProfiles() {
   try {
-    console.log("🔍 Extracting current token profiles from Solana stream...");
-    const profileRes = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1');
-    const incomingProfiles = profileRes.data || [];
+    console.log("🔍 Extracting current token profiles from Solana dual-streams...");
+    
+    // UPGRADED ENGINE: Concurrently requesting both feeds to maximize data volume
+    const [latestRes, updatesRes] = await Promise.all([
+      axios.get('https://api.dexscreener.com/token-profiles/latest/v1'),
+      axios.get('https://api.dexscreener.com/token-profiles/recent-updates/v1')
+    ]);
 
-    for (const profile of incomingProfiles) {
-      if (profile.chainId !== 'solana' || !profile.tokenAddress) continue;
+    const combinedProfiles = [...(latestRes.data || []), ...(updatesRes.data || [])];
+    
+    // Deduplicate profiles by token address so we don't scan the same token twice
+    const uniqueProfilesMap = new Map();
+    for (const profile of combinedProfiles) {
+      if (profile.chainId === 'solana' && profile.tokenAddress) {
+        uniqueProfilesMap.set(profile.tokenAddress, profile);
+      }
+    }
 
+    for (const profile of uniqueProfilesMap.values()) {
       const hasTwitter = profile.links?.some((l: any) => l.type === 'twitter' || l.url?.includes('x.com') || l.url?.includes('twitter.com'));
       if (!hasTwitter) continue;
 
@@ -298,7 +307,7 @@ async function scanSolanaTokenProfiles() {
               if (tradeReceipt) {
                 buySuccessString = `🟢 <b>AUTO-BUY EXECUTED</b>\nAllocated 20% Wallet Balance\nTx: <code>${tradeReceipt.txid}</code>`;
                 
-                await db.query(`
+                await db.query suicide(`
                   UPDATE token_intelligence 
                   SET bought = TRUE, buy_price_usd = $1, tokens_held = $2 
                   WHERE token_address = $3
