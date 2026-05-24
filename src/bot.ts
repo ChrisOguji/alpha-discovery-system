@@ -74,7 +74,6 @@ function evaluatedLoreUniqueness(tokenAddress: string, description: string): boo
   
   const formattedText = description.toLowerCase();
   
-  // Strict algorithmic blocking of standard repetitive copy-paste meta hashes
   const pvpRedFlags = [
     'pvp', 'player vs player', 'fair launch', 'no dev', 'dev left', 
     'community take over', 'cto', 'moon', '1000x', 'pump', 'chillguy'
@@ -83,7 +82,6 @@ function evaluatedLoreUniqueness(tokenAddress: string, description: string): boo
   const containsPvPMeta = pvpRedFlags.some(flag => formattedText.includes(flag));
   if (containsPvPMeta) return false;
 
-  // Enforces structural depth of lore and narrative presentation parameters
   const minimumLoreWordLength = 12;
   const wordCount = description.split(/\s+/).length;
   
@@ -126,7 +124,7 @@ async function executeJupiterSwap(inputMint: string, outputMint: string, lamport
   }
 }
 
-// 6. TRACKING RISK & DYNAMIC TAKE-PROFIT CONTROLLER (POSITION MONITOR)
+// 6. TRACKING RISK, HARD STOP-LOSS, & DYNAMIC TAKE-PROFIT CONTROLLER
 async function processActivePositions() {
   if (!fundingWallet) return;
   try {
@@ -142,14 +140,28 @@ async function processActivePositions() {
       if (entryPriceUsd <= 0 || currentPriceUsd <= 0) continue;
 
       const currentMultiplier = currentPriceUsd / entryPriceUsd;
+
+      // 🛑 INTEGRATED ADDITION: Hard Stop-Loss Triggered at a 30% Dump (Multiplier <= 0.70)
+      if (currentMultiplier <= 0.70) {
+        console.log(`🛑 STOP-LOSS TRIGGERED: $${pos.ticker} dropped 30% below entry. Commencing emergency liquidation...`);
+        const totalTokensToSell = parseFloat(pos.tokens_held);
+        
+        const sellResult = await executeJupiterSwap(pos.token_address, "So11111111111111111111111111111111111111112", Math.floor(totalTokensToSell * Math.pow(10, 9)));
+        
+        if (sellResult) {
+          await db.query('UPDATE token_intelligence SET tokens_held = 0 WHERE token_address = $1', [pos.token_address]);
+          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `🛑 <b>STOP-LOSS LIQUIDATION EXECUTED</b> 🛑\n\nPosition on $${pos.ticker} hit the -30% threshold. Emergency market swap back to SOL complete to protect core capital.\n• Entry Price: $${entryPriceUsd}\n• Exit Price: $${currentPriceUsd}`);
+          continue; // Move immediately to next token position processing
+        }
+      }
+
       let highestMultiplier = Math.max(parseFloat(pos.highest_multiplier || '1.0'), currentMultiplier);
 
-      // SPECIFICATION: Initial Capital Recovery at 2.0x Return
+      // TAKE PROFIT 1: Initial Capital Recovery at 2.0x Return
       if (highestMultiplier >= 2.0 && parseFloat(pos.highest_multiplier || '1.0') < 2.0) {
         console.log(`🎯 Milestone Hit: 2x on $${pos.ticker}. Triggering initial capital recovery execution...`);
         const totalTokensToSell = parseFloat(pos.tokens_held) * 0.5; 
         
-        // FIXED: Shifted scaling metrics calculation upward to native 9-decimal precision strings
         const sellResult = await executeJupiterSwap(pos.token_address, "So11111111111111111111111111111111111111112", Math.floor(totalTokensToSell * Math.pow(10, 9)));
         
         if (sellResult) {
@@ -158,7 +170,7 @@ async function processActivePositions() {
         }
       }
 
-      // SPECIFICATION: Follow-Up Tier Scaling Engine: Sell 30% for every additional 2x increment achieved
+      // TAKE PROFIT 2: Follow-Up Tier Scaling Engine: Sell 30% for every additional 2x increment achieved
       const expectedNextTier = Math.floor(highestMultiplier / 2.0) * 2.0;
       const lastRecordedTier = Math.floor(parseFloat(pos.highest_multiplier || '1.0') / 2.0) * 2.0;
 
@@ -228,10 +240,10 @@ async function scanSolanaTokenProfiles() {
 
       const metrics = calculateAlphaMetrics(pairData);
 
-      // FILTER GATE 1: Rigid Market Cap Guardrails (Min: 7k, Max: 100k)
+      // Market Cap Guardrails (Min: 7k, Max: 100k)
       if (metrics.marketCap < 7000 || metrics.marketCap > 100000) continue;
 
-      // FILTER GATE 2: Track For Aggressive Developer Dumping Mechanics
+      // Track For Aggressive Developer Dumping Mechanics
       const sellRatio5m = pairData.txns?.m5?.sells || 0;
       const buyRatio5m = pairData.txns?.m5?.buys || 0;
       const totalRatio = buyRatio5m + sellRatio5m;
@@ -253,7 +265,6 @@ async function scanSolanaTokenProfiles() {
         const alreadyAlerted = checkDup.rows[0]?.alert_sent || false;
         const alreadyBought = checkDup.rows[0]?.bought || false;
         
-        // EXECUTE AUTOMATED ALLOCATION ENGINE
         let buySuccessString = "⚠️ Auto-Buy Bypassed (Inactive Wallet Configuration Key)";
         
         if (!alreadyBought && fundingWallet) {
@@ -284,8 +295,6 @@ async function scanSolanaTokenProfiles() {
 
         if (!alreadyAlerted && TELEGRAM_CHAT_ID) {
           const deployerWallet = profile.deployer || "PumpFun_Contract_Agent";
-          
-          // CRITICAL FEATURE: Injected live formatted Market Cap calculation output directly into telemetry block
           const formattedMCAP = metrics.marketCap > 0 ? `$${metrics.marketCap.toLocaleString()}` : "Calculating...";
 
           const message = `🚨 <b>AUTONOMOUS AI LORE DEGEN CALL</b> 🚨\n\n` +
@@ -302,7 +311,6 @@ async function scanSolanaTokenProfiles() {
                           `• Dynamic Mode: ⚡ <code>${metrics.classification}</code>\n\n` +
                           `📱 <a href="https://dexscreener.com/solana/${metrics.tokenAddress}">Monitor Chart Live</a>`;
 
-          // FIXED: Forced a type asset projection fallback rule on configuration fields to protect runtime parameters
           await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, message, { 
             parse_mode: 'HTML', 
             disable_web_page_preview: true 
@@ -327,7 +335,7 @@ async function main() {
 
   // Active Monitoring Cycles
   setInterval(scanSolanaTokenProfiles, 1000 * 60 * 3);
-  setInterval(processActivePositions, 1000 * 30); 
+  setInterval(processActivePositions, 1000 * 30); // Checks price drops/surges every 30 seconds
   
   scanSolanaTokenProfiles();
 
