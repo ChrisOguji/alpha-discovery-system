@@ -14,7 +14,6 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Initialize Telegram Bot safely
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 
@@ -30,7 +29,6 @@ interface TokenMetrics {
 // ==========================================
 async function initDatabase() {
   try {
-    // Phase 1 Legacy Accounts integration
     await db.query(`
       CREATE TABLE IF NOT EXISTS accounts (
         username TEXT PRIMARY KEY,
@@ -41,7 +39,6 @@ async function initDatabase() {
       );
     `);
 
-    // Advanced Deep Intelligence Tables
     await db.query(`
       CREATE TABLE IF NOT EXISTS token_intelligence (
         token_address TEXT PRIMARY KEY,
@@ -97,17 +94,11 @@ async function fetchLiveMarketData(tokenAddress: string) {
 // MACHINE LEARNING & COGNITIVE RISK ALGORITHMS
 // ==========================================
 function evaluateTokenIntelligence(metrics: TokenMetrics) {
-  // 1. Logistic regression approximation for structural rug probability
   const logit = -2.3 + (3.5 * metrics.clusterRisk) + (2.0 * metrics.freshWalletRatio) + (4.8 * metrics.insiderSupplyPercentage);
   const rugProbability = 1 / (1 + Math.exp(-logit));
-
-  // 2. Compute narrative propagation velocity metrics
   const narrativeStrength = Math.min(100, metrics.volumeVelocity * 40.0);
-
-  // 3. Compute structural unified Degen Alpha Score
   const alphaScore = Math.min(100, (narrativeStrength * 0.75 + (100 - (rugProbability * 100)) * 0.25));
 
-  // 4. Autonomous Classification Assignment
   let classification = 'ORGANIC';
   if (rugProbability > 0.70) classification = 'HIGH_RUG_RISK';
   else if (metrics.insiderSupplyPercentage > 0.35) classification = 'INSIDER_DRIVEN';
@@ -126,28 +117,25 @@ function evaluateTokenIntelligence(metrics: TokenMetrics) {
 // DISCOVERY ROUTER & TELEGRAM ALERT PIPELINE
 // ==========================================
 async function runAutonomousTradingEngine() {
-  console.log("🔍 Running scanning sequence for high-potential setups...");
+  console.log("🔍 Scanning scanning sequence for high-potential setups...");
   const rawProfiles = await pullLiveTokenProfiles();
 
   for (const token of rawProfiles) {
     if (token.chainId !== 'solana' || !token.tokenAddress) continue;
 
-    // Find the Twitter handle linked to this token
     const twitterLink = token.links?.find((l: any) => l.type === 'twitter' || l.url.includes('x.com'));
     if (!twitterLink) continue;
 
     let username = twitterLink.url.split('/').pop()?.replace('@', '').split('?')[0].trim().toLowerCase();
     if (!username || username === 'home' || username === 'i') continue;
 
-    // Phase 1 Account Tracking Bridge Update
     await db.query(`
       INSERT INTO accounts (username) VALUES ($1) ON CONFLICT (username) DO UPDATE SET total_signals_tracked = accounts.total_signals_tracked + 1
     `, [username]);
 
     const market = await fetchLiveMarketData(token.tokenAddress);
-    if (!market || market.liquidityUsd < 5000) continue; // Minimum liquidity safeguard
+    if (!market || market.liquidityUsd < 5000) continue;
 
-    // Simulating advanced multi-hop parameters via on-chain variance modeling
     const simulatedMetrics: TokenMetrics = {
       clusterRisk: market.volume24h > 500000 ? 0.45 : 0.15,
       freshWalletRatio: market.liquidityUsd < 20000 ? 0.55 : 0.12,
@@ -157,7 +145,6 @@ async function runAutonomousTradingEngine() {
 
     const aiResult = evaluateTokenIntelligence(simulatedMetrics);
 
-    // Save calculation data records securely
     const dbResult = await db.query(`
       INSERT INTO token_intelligence (token_address, ticker, alpha_score, rug_probability, insider_risk_score, narrative_strength, classification)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -171,7 +158,6 @@ async function runAutonomousTradingEngine() {
 
     const alertAlreadySent = dbResult.rows[0]?.alert_sent;
 
-    // TRIGGER CONVICTION TRADING TELEGRAM ALERTS
     if (!alertAlreadySent && aiResult.alphaScore >= 65 && aiResult.rugProbability < 0.35) {
       const signalAlertMessage = 
 `🚨 <b>AUTONOMOUS AI DEGEN CALL</b> 🚨\n\n` +
@@ -190,7 +176,11 @@ async function runAutonomousTradingEngine() {
 
       if (TELEGRAM_CHAT_ID) {
         try {
-          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, signalAlertMessage, { parse_mode: 'HTML', disable_web_page_preview: true });
+          // BUG FIX: Updated format for telegraf v4 compatibility
+          await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, signalAlertMessage, { 
+            parse_mode: 'HTML', 
+            link_preview: { disable: true } 
+          });
           await db.query(`UPDATE token_intelligence SET alert_sent = TRUE WHERE token_address = $1`, [token.tokenAddress]);
           console.log(`✈️ Automated Trade alert broadcasted to Telegram channel for $${market.symbol}`);
         } catch (telegramErr) {
@@ -207,19 +197,16 @@ async function runAutonomousTradingEngine() {
 async function main() {
   await initDatabase();
 
-  // Initialize and start Telegram polling mechanics instantly
   if (process.env.TELEGRAM_BOT_TOKEN) {
     bot.launch().then(() => console.log("🤖 Telegram Integration Service Online. Listening..."));
   } else {
-    console.log("⚠️ Missing TELEGRAM_BOT_TOKEN. Alerts fallback to console logger output execution.");
+    console.log("⚠️ Missing TELEGRAM_BOT_TOKEN.");
   }
 
-  // System Pipeline Loops
   setInterval(async () => {
     try { await runAutonomousTradingEngine(); } catch (e) { console.error(e); }
-  }, 1000 * 60 * 3); // Run evaluations every 3 minutes
+  }, 1000 * 60 * 3);
 
-  // Keep Render Web Service open/active via standard internal server bind
   const port = process.env.PORT || 3000;
   http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
