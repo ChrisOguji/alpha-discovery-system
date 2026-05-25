@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { VersionedTransaction, Keypair } from '@solana/web3.js';
-import * as bs58 from 'bs58';
+import bs58 from 'bs58';
 
 export class LowLatencyExecutionEngine {
   private jupiterUrl = 'https://quote-api.jup.ag/v6';
