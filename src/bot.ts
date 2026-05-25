@@ -16,7 +16,6 @@ async function scan() {
         
         for (const p of profiles.slice(0, 5)) {
             try {
-                // Rate limit delay
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 
                 const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`);
@@ -27,7 +26,6 @@ async function scan() {
                 const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
                 console.log(`Checking ${pair.baseToken.symbol}: MCAP is ${mcap}`);
 
-                // Trade/Alert Criteria
                 if (mcap > 5000 && mcap < 500000) {
                     const msg = `🚀 Alpha: $${pair.baseToken.symbol} | MCAP: $${mcap.toLocaleString()}`;
                     await bot.telegram.sendMessage(process.env.TELEGRAM_CHAT_ID || '', msg);
@@ -57,3 +55,7 @@ bot.command('test', (ctx) => ctx.reply('Bot is online.'));
 
 // 5. Run scanner every 60 seconds
 setInterval(scan, 60000);
+
+// ✅ ADD THESE — Graceful shutdown so Render cleanly kills old instance before new one starts
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
