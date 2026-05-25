@@ -1,7 +1,6 @@
 import { Telegraf } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
-import * as http from 'http';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
@@ -15,22 +14,16 @@ const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const PORT = Number(process.env.PORT) || 10000;
+const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
-// Keep Render Web Service alive
-const PORT = process.env.PORT || 3000;
-http.createServer((_, res) => {
-  res.writeHead(200);
-  res.end('Bot is running');
-}).listen(PORT, () => {
-  console.log(`✅ Health check server on port ${PORT}`);
-});
-
-function escape(text: string): string {
+// Only escape text strings, never numbers
+function escapeText(text: string): string {
   return String(text).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }
 
 function getDynamicMode(score: number): string {
-  if (score >= 90) return '⚡ HIGH_POTENTIAL_RUNNER';
+  if (score >= 90) return '⚡ HIGH\\_POTENTIAL\\_RUNNER';
   if (score >= 75) return '⚡ ORGANIC';
   return '⚡ SPECULATIVE';
 }
@@ -74,49 +67,48 @@ async function scan() {
         ]);
 
         let executionState = '';
-
         if (risk.allow && pattern.passedPatterns) {
           try {
             const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
-            if (result.success) {
-              executionState = `✅ Auto-Buy Executed | Bundle: ${result.bundleId}`;
-            } else {
-              executionState = `❌ Auto-Buy Failed: ${result.error}`;
-            }
+            executionState = result.success
+              ? `✅ Auto\\-Buy Executed`
+              : `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
           } catch (execErr: any) {
-            executionState = `❌ Auto-Buy Execution Blocked (${execErr.message})`;
+            executionState = `❌ Execution Blocked: ${escapeText(execErr.message)}`;
           }
         } else {
-          const blockReason = !risk.allow ? risk.reason : pattern.reason;
-          executionState = `❌ Auto-Buy Blocked: ${escape(blockReason || '')}`;
+          const reason = (!risk.allow ? risk.reason : pattern.reason) || '';
+          executionState = `❌ Auto\\-Buy Blocked: ${escapeText(reason)}`;
         }
 
-        const msg = `
-🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨
+        const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
 
-*Token:* $${escape(ticker)}
-*Address:* \`${address}\`
-*Market Cap:* 💰 $${escape(mcap.toLocaleString())}
-*Liquidity:* $${escape(liquidity.toLocaleString())}
-
-🤖 *Execution State:*
-${executionState}
-
-👾 *Deployer Metrics:*
-• Wallet: \`${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}\`
-• Bundled Launch: ${pattern.isBundledLaunch ? '⚠️ Yes' : '✅ No'}
-• Top Holder %: ${pattern.topHolderConcentration}%
-• Liquidity Locked: ${pattern.isLiquidityLocked ? '✅ Yes' : '❌ No'}
-
-📊 *AI Intelligence Matrix:*
-• Alpha Score: 🟢 ${alphaScore}/100
-• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%
-• Dynamic Mode: ${getDynamicMode(alphaScore)}
-
-📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})
-        `.trim();
+        const msg = [
+          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`,
+          ``,
+          `*Token:* $${escapeText(ticker)}`,
+          `*Address:* \`${address}\``,
+          `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          ``,
+          `🤖 *Execution State:*`,
+          executionState,
+          ``,
+          `👾 *Deployer Metrics:*`,
+          `• Wallet: \`${walletShort}\``,
+          `• Bundled Launch: ${pattern.isBundledLaunch ? '⚠️ Yes' : '✅ No'}`,
+          `• Top Holder %: ${pattern.topHolderConcentration}%`,
+          `• Liquidity Locked: ${pattern.isLiquidityLocked ? '✅ Yes' : '❌ No'}`,
+          ``,
+          `📊 *AI Intelligence Matrix:*`,
+          `• Alpha Score: 🟢 ${alphaScore}/100`,
+          `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
+          `• Dynamic Mode: ${getDynamicMode(alphaScore)}`,
+          ``,
+          `📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`,
+        ].join('\n');
 
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Rich alert sent for ${ticker}`);
@@ -130,14 +122,18 @@ ${executionState}
   }
 }
 
-// Launch
-bot.launch({ dropPendingUpdates: true })
-  .then(() => console.log("🤖 Bot Live"))
-  .catch((err) => { console.error("Fatal Launch Error:", err); process.exit(1); });
+bot.launch({
+  webhook: { domain: DOMAIN, port: PORT }
+}).then(() => {
+  console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
+  scan();
+  setInterval(scan, 60000);
+}).catch((err) => {
+  console.error("Fatal Launch Error:", err);
+  process.exit(1);
+});
 
 bot.command('test', (ctx) => ctx.reply('✅ Bot is online and all engines loaded.'));
-
-setInterval(scan, 60000);
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
