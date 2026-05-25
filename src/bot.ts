@@ -1,29 +1,23 @@
+import axios from 'axios';
+import { Pool } from 'pg';
+import { Telegraf } from 'telegraf';
+import * as dotenv from 'dotenv';
 import * as http from 'http';
+import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import b58 from 'bs58';
 
-const PORT = process.env.PORT || 3000;
+dotenv.config();
+
+// 1. Fix: Ensure PORT is treated as a number
+const PORT = parseInt(process.env.PORT || '3000', 10);
+
+// 2. Fix: Single declaration of http server
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Bot is healthy');
 }).listen(PORT, '0.0.0.0', () => {
   console.log(`🤖 Server listening on port ${PORT}`);
 });
-
-import axios from 'axios';
-import { Pool } from 'pg';
-import { Telegraf } from 'telegraf';
-import * as dotenv from 'dotenv';
-import * as http from 'http'; // Required to keep Render alive
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
-import b58 from 'bs58';
-
-dotenv.config();
-
-// 1. WEB SERVER BINDING (Fixes Render "No Port Detected")
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Bot is running');
-}).listen(PORT, '0.0.0.0', () => console.log(`🤖 Server listening on port ${PORT}`));
 
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
@@ -39,7 +33,6 @@ if (process.env.SOLANA_WALLET_PRIVATE_KEY) {
 async function executeJupiterSwap(outputMint: string, lamports: number): Promise<any> {
   if (!fundingWallet) return null;
   
-  // Use private RPC defined in Environment
   try {
     const q = await axios.get(`https://quote-api.jup.ag/v6/quote`, {
       params: {
@@ -47,7 +40,7 @@ async function executeJupiterSwap(outputMint: string, lamports: number): Promise
         outputMint: outputMint,
         amount: lamports,
         slippageBps: 2000, 
-        onlyDirectRoutes: false // Aggressive routing
+        onlyDirectRoutes: false
       }, timeout: 10000
     });
 
@@ -78,10 +71,9 @@ async function scan() {
       if (!pair) continue;
       
       const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
-      // Relaxed criteria to ensure we find coins
       if (mcap > 5000 && mcap < 500000) {
         console.log(`🚀 Found: ${pair.baseToken.symbol} | MCAP: ${mcap}`);
-        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `🚀 Alpha: $${pair.baseToken.symbol} | MCAP: $${mcap.toLocaleString()}`);
+        await bot.telegram.sendMessage(TELEGRAM_CHAT_ID, `🚀 Alpha: $${pair.baseToken.symbol} | MCAP: ${mcap.toLocaleString()}`);
         executeJupiterSwap(p.tokenAddress, 5000000);
       }
     }
@@ -90,5 +82,5 @@ async function scan() {
 
 bot.launch().then(() => {
   console.log("🤖 Bot Live");
-  setInterval(scan, 1000 * 60 * 1); // Scan every 1 min
+  setInterval(scan, 1000 * 60 * 1);
 });
