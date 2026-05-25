@@ -38,9 +38,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
 
-  // ✅ Updated MCAP range: $1k–$70k sweet spot
   if (mcap >= 1000 && mcap <= 70000) score += 25;
-  else if (mcap >= 1000 && mcap <= 70000) score += 15;
 
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
@@ -92,7 +90,6 @@ async function scan() {
           continue;
         }
 
-        // ✅ Hard MCAP filter: $1k–$70k only
         if (mcap < 1000 || mcap > 70000) {
           console.log(`⏭ MCAP out of range ($${mcap}) — skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
@@ -104,9 +101,9 @@ async function scan() {
 
         console.log(`Checking ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        // ✅ Only alert on perfect 100 score
-        if (alphaScore < 100) {
-          console.log(`⏭ Score ${alphaScore}/100 — not 100, skipping ${ticker}`);
+        // ✅ Updated: 85+ threshold
+        if (alphaScore < 85) {
+          console.log(`⏭ Score ${alphaScore}/100 — below 85, skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -165,7 +162,7 @@ async function scan() {
           `• Liquidity Locked: ${pattern.isLiquidityLocked ? '✅ Yes' : '❌ No'}`,
           ``,
           `📊 *AI Intelligence Matrix:*`,
-          `• Alpha Score: 🟢 ${alphaScore}/100 — 🔥 PERFECT SCORE`,
+          `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
           `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
           `• Dynamic Mode: ${getDynamicMode(alphaScore)}`,
           ``,
@@ -173,7 +170,7 @@ async function scan() {
         ].join('\n');
 
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-        console.log(`✅ PERFECT SCORE alert sent for ${ticker}`);
+        console.log(`✅ Alert sent for ${ticker} — Score: ${alphaScore}/100`);
 
         seenTokens.add(p.tokenAddress);
         if (seenTokens.size > 500) seenTokens.clear();
@@ -198,7 +195,7 @@ bot.launch({
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot is online. Scanning for 100/100 score tokens between $1k–$70k mcap.'));
+bot.command('test', (ctx) => ctx.reply('✅ Bot is online. Scanning for 85+/100 score tokens between $1k–$70k mcap.'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
