@@ -194,24 +194,28 @@ export class OnChainPatternRecognition {
 
   // ── Real pump.fun detection ──
   private async isPumpFunToken(mint: string): Promise<boolean> {
-    try {
-      const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+  try {
+    // ✅ All pump.fun token addresses end in 'pump'
+    if (mint.endsWith('pump')) return true;
 
-      const res = await axios.get(`${HELIUS_API}/addresses/${mint}/transactions`, {
-        params: { 'api-key': HELIUS_API_KEY, limit: 5 },
-        timeout: 5000
-      });
+    // Fallback: check Helius transactions for pump.fun program
+    const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+    const res = await axios.get(`${HELIUS_API}/addresses/${mint}/transactions`, {
+      params: { 'api-key': HELIUS_API_KEY, limit: 5 },
+      timeout: 5000
+    });
 
-      const txs = res.data || [];
-      return txs.some((tx: any) =>
-        (tx.accountData || []).some((a: any) => a.account === PUMP_FUN_PROGRAM) ||
-        tx.source?.toLowerCase() === 'pump_fun' ||
-        tx.description?.toLowerCase().includes('pump.fun')
-      );
-    } catch {
-      return false;
-    }
+    const txs = res.data || [];
+    return txs.some((tx: any) =>
+      (tx.accountData || []).some((a: any) => a.account === PUMP_FUN_PROGRAM) ||
+      tx.source?.toLowerCase() === 'pump_fun' ||
+      tx.description?.toLowerCase().includes('pump.fun')
+    );
+  } catch {
+    // If Helius fails, fall back to address check
+    return mint.endsWith('pump');
   }
+}
 
   // ── MAIN ANALYSIS ──
   public async analyzePattern(signal: TokenSignal, creatorAddress?: string): Promise<PatternMetrics> {
