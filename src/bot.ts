@@ -38,6 +38,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
 
+  // ✅ Fixed: removed duplicate condition
   if (mcap >= 1000 && mcap <= 70000) score += 25;
 
   if (liquidity >= 25000) score += 20;
@@ -63,7 +64,10 @@ function computeRugProbability(mcap: number, liquidity: number): number {
 async function scan() {
   console.log("🔍 Scanning DexScreener...");
   try {
-    const { data: profiles } = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1');
+    const { data: profiles } = await axios.get(
+      'https://api.dexscreener.com/token-profiles/latest/v1',
+      { timeout: 10000 }
+    );
     console.log(`Found ${profiles.length} profiles. Checking top 20...`);
 
     for (const p of profiles.slice(0, 20)) {
@@ -75,7 +79,10 @@ async function scan() {
           continue;
         }
 
-        const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`);
+        const { data } = await axios.get(
+          `https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`,
+          { timeout: 8000 }
+        );
         const pair = data?.pairs?.[0];
         if (!pair) continue;
 
@@ -84,14 +91,16 @@ async function scan() {
         const ticker = pair.baseToken.symbol;
         const address = pair.baseToken.address;
 
+        // ✅ Extract deployer from pair data and pass to intelligence
+        const creatorAddress = pair.info?.deployer || undefined;
+
         if (!mcap || !liquidity) {
-          console.log(`⏭ Skipping ${ticker}: missing data`);
           seenTokens.add(p.tokenAddress);
           continue;
         }
 
         if (mcap < 1000 || mcap > 70000) {
-          console.log(`⏭ MCAP out of range ($${mcap}) — skipping ${ticker}`);
+          console.log(`⏭ MCAP $${mcap} out of range — skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -101,7 +110,6 @@ async function scan() {
 
         console.log(`Checking ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        // ✅ Updated: 85+ threshold
         if (alphaScore < 85) {
           console.log(`⏭ Score ${alphaScore}/100 — below 85, skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
@@ -117,13 +125,21 @@ async function scan() {
           marketCapUsd: mcap,
         };
 
+        // ✅ Now passes creatorAddress for real deployer history check
         const [pattern, risk] = await Promise.all([
-          intelligence.analyzePattern(signal),
+          intelligence.analyzePattern(signal, creatorAddress),
           riskEngine.validateExecutionRisk(signal),
         ]);
 
+        // Skip if pattern gates failed
+        if (!pattern.passedPatterns) {
+          console.log(`⏭ ${ticker} failed intelligence gate: ${pattern.reason}`);
+          seenTokens.add(p.tokenAddress);
+          continue;
+        }
+
         let executionState = '';
-        if (risk.allow && pattern.passedPatterns) {
+        if (risk.allow) {
           try {
             const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
             tx.sign([executor.getWalletKeypair()]);
@@ -132,14 +148,14 @@ async function scan() {
               ? `✅ Auto\\-Buy Executed`
               : `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
           } catch (execErr: any) {
-            const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
+            const isNetworkErr = execErr.message?.includes('ENOTFOUND') ||
+              execErr.message?.includes('ECONNREFUSED');
             executionState = isNetworkErr
               ? `⏸ Execution Paused: Jupiter unreachable on free tier`
               : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
           }
         } else {
-          const reason = (!risk.allow ? risk.reason : pattern.reason) || '';
-          executionState = `❌ Auto\\-Buy Blocked: ${escapeText(reason)}`;
+          executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
@@ -160,10 +176,15 @@ async function scan() {
           `• Bundled Launch: ${pattern.isBundledLaunch ? '⚠️ Yes' : '✅ No'}`,
           `• Top Holder %: ${pattern.topHolderConcentration}%`,
           `• Liquidity Locked: ${pattern.isLiquidityLocked ? '✅ Yes' : '❌ No'}`,
+          `• Wash Trading: ${pattern.washTradingDetected ? '⚠️ Detected' : '✅ Clean'}`,
+          `• Unique Buyers: ${pattern.uniqueBuyers} \\(${pattern.buyerVelocity} velocity\\)`,
+          `• Smart Money: ${pattern.smartCohortPresence ? '✅ Present' : '➖ None'}`,
+          `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '❌ No'}`,
           ``,
           `📊 *AI Intelligence Matrix:*`,
           `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
           `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
+          `• Dev Rug History: ${pattern.devRugHistoryCount} prior rugs`,
           `• Dynamic Mode: ${getDynamicMode(alphaScore)}`,
           ``,
           `📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`,
@@ -195,7 +216,7 @@ bot.launch({
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot is online. Scanning for 85+/100 score tokens between $1k–$70k mcap.'));
+bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun lowcaps — 85+/100, $1k–$70k mcap.'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
