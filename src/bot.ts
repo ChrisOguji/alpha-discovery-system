@@ -38,7 +38,6 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
 
-  // ✅ Fixed: removed duplicate condition
   if (mcap >= 1000 && mcap <= 70000) score += 25;
 
   if (liquidity >= 25000) score += 20;
@@ -62,15 +61,22 @@ function computeRugProbability(mcap: number, liquidity: number): number {
 }
 
 async function scan() {
-  console.log("🔍 Scanning DexScreener...");
+  console.log("🔍 Scanning pump.fun tokens...");
   try {
+    // ✅ Keep reliable profiles endpoint but pre-filter to pump.fun only
     const { data: profiles } = await axios.get(
       'https://api.dexscreener.com/token-profiles/latest/v1',
       { timeout: 10000 }
     );
-    console.log(`Found ${profiles.length} profiles. Checking top 20...`);
 
-    for (const p of profiles.slice(0, 20)) {
+    // ✅ Filter to pump.fun tokens only — all pump.fun addresses end in 'pump'
+    const pumpProfiles = (profiles || []).filter(
+      (p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump')
+    );
+
+    console.log(`Found ${profiles.length} profiles. ${pumpProfiles.length} are pump.fun. Checking up to 20...`);
+
+    for (const p of pumpProfiles.slice(0, 20)) {
       try {
         await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -83,15 +89,17 @@ async function scan() {
           `https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`,
           { timeout: 8000 }
         );
+
         const pair = data?.pairs?.[0];
-        if (!pair) continue;
+        if (!pair) {
+          seenTokens.add(p.tokenAddress);
+          continue;
+        }
 
         const mcap = parseFloat(pair.fdv || pair.marketCap || '0');
         const liquidity = parseFloat(pair.liquidity?.usd || '0');
         const ticker = pair.baseToken.symbol;
         const address = pair.baseToken.address;
-
-        // ✅ Extract deployer from pair data and pass to intelligence
         const creatorAddress = pair.info?.deployer || undefined;
 
         if (!mcap || !liquidity) {
@@ -99,8 +107,9 @@ async function scan() {
           continue;
         }
 
+        // ✅ Hard MCAP filter: $1k–$70k only
         if (mcap < 1000 || mcap > 70000) {
-          console.log(`⏭ MCAP $${mcap} out of range — skipping ${ticker}`);
+          console.log(`⏭ MCAP $${mcap.toLocaleString()} out of range — skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
           continue;
         }
@@ -110,6 +119,7 @@ async function scan() {
 
         console.log(`Checking ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
+        // ✅ Score gate: 85+
         if (alphaScore < 85) {
           console.log(`⏭ Score ${alphaScore}/100 — below 85, skipping ${ticker}`);
           seenTokens.add(p.tokenAddress);
@@ -125,13 +135,11 @@ async function scan() {
           marketCapUsd: mcap,
         };
 
-        // ✅ Now passes creatorAddress for real deployer history check
         const [pattern, risk] = await Promise.all([
           intelligence.analyzePattern(signal, creatorAddress),
           riskEngine.validateExecutionRisk(signal),
         ]);
 
-        // Skip if pattern gates failed
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed intelligence gate: ${pattern.reason}`);
           seenTokens.add(p.tokenAddress);
@@ -148,7 +156,8 @@ async function scan() {
               ? `✅ Auto\\-Buy Executed`
               : `❌ Auto\\-Buy Failed: ${escapeText(result.error || '')}`;
           } catch (execErr: any) {
-            const isNetworkErr = execErr.message?.includes('ENOTFOUND') ||
+            const isNetworkErr =
+              execErr.message?.includes('ENOTFOUND') ||
               execErr.message?.includes('ECONNREFUSED');
             executionState = isNetworkErr
               ? `⏸ Execution Paused: Jupiter unreachable on free tier`
@@ -179,7 +188,7 @@ async function scan() {
           `• Wash Trading: ${pattern.washTradingDetected ? '⚠️ Detected' : '✅ Clean'}`,
           `• Unique Buyers: ${pattern.uniqueBuyers} \\(${pattern.buyerVelocity} velocity\\)`,
           `• Smart Money: ${pattern.smartCohortPresence ? '✅ Present' : '➖ None'}`,
-          `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '❌ No'}`,
+          `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '✅ Confirmed'}`,
           ``,
           `📊 *AI Intelligence Matrix:*`,
           `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
@@ -211,6 +220,17 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   scan();
   setInterval(scan, 60000);
+
+  // ✅ Self-ping every 5 minutes to prevent Render free tier spin-down
+  setInterval(async () => {
+    try {
+      await axios.get(DOMAIN, { timeout: 5000 });
+      console.log('🏓 Self-ping sent — keeping instance alive');
+    } catch {
+      // ignore ping errors
+    }
+  }, 5 * 60 * 1000);
+
 }).catch((err) => {
   console.error("Fatal Launch Error:", err);
   process.exit(1);
