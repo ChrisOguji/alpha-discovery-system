@@ -8,16 +8,12 @@ import b58 from 'bs58';
 
 dotenv.config();
 
-// 1. Fix: Ensure PORT is treated as a number
+// 1. WEB SERVER BINDING: Required for Render Web Service health checks
 const PORT = parseInt(process.env.PORT || '3000', 10);
-
-// 2. Fix: Single declaration of http server
 http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Bot is healthy');
-}).listen(PORT, '0.0.0.0', () => {
-  console.log(`🤖 Server listening on port ${PORT}`);
-});
+}).listen(PORT, '0.0.0.0', () => console.log(`🤖 Server listening on port ${PORT}`));
 
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
@@ -32,7 +28,6 @@ if (process.env.SOLANA_WALLET_PRIVATE_KEY) {
 
 async function executeJupiterSwap(outputMint: string, lamports: number): Promise<any> {
   if (!fundingWallet) return null;
-  
   try {
     const q = await axios.get(`https://quote-api.jup.ag/v6/quote`, {
       params: {
@@ -80,7 +75,12 @@ async function scan() {
   } catch (e) { console.error("Scan error:", e); }
 }
 
+// 2. CONFLICT RESOLUTION: Ensure only one instance polls
+bot.stop();
 bot.launch().then(() => {
-  console.log("🤖 Bot Live");
-  setInterval(scan, 1000 * 60 * 1);
+  console.log("🤖 Bot Live - Polling Started");
+}).catch((err) => {
+  console.error("Failed to launch bot:", err);
 });
+
+setInterval(scan, 1000 * 60 * 1);
