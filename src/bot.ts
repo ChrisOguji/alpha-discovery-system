@@ -721,5 +721,24 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
+// --- HEARTBEAT TIMER ---
+// This forces the bot to stay awake and check in every 15 minutes
+setInterval(() => {
+  // Pulls the chat ID directly from your Render environment variables
+  const chatID = process.env.TELEGRAM_CHAT_ID; 
+  
+  if (chatID) {
+    bot.telegram.sendMessage(
+      chatID, 
+      "⏱️ *Heartbeat:* Bot is awake and monitoring the market...",
+      { parse_mode: 'Markdown' }
+    ).catch((err: any) => console.log("Heartbeat error:", err.message));
+  } else {
+    console.log("Error: TELEGRAM_CHAT_ID environment variable is missing.");
+  }
+  
+}, 15 * 60 * 1000); // 15 minutes in milliseconds
+
+
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
