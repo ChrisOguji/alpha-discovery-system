@@ -7,6 +7,17 @@ import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
 
+// ✅ Keep-alive HTTP server for Render
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is running');
+});
+
+const PORT = Number(process.env.PORT) || 10000;
+server.listen(PORT, () => {
+  console.log(`✅ HTTP keep-alive server listening on port ${PORT}`);
+});
+
 dotenv.config();
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
