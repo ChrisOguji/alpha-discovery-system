@@ -2,23 +2,24 @@ import { Telegraf, Markup } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
 import WebSocket from 'ws';
+import http from 'http'; // ✅ Added import
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
 import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
 
-// ✅ Keep-alive HTTP server for Render
-const server = http.createServer((req, res) => {
+dotenv.config();
+
+// ✅ Create HTTP server for Render keep-alive
+const PORT = Number(process.env.PORT) || 10000;
+const server = http.createServer((req: any, res: any) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Bot is running');
 });
 
-const PORT = Number(process.env.PORT) || 10000;
 server.listen(PORT, () => {
   console.log(`✅ HTTP keep-alive server listening on port ${PORT}`);
 });
-
-dotenv.config();
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
 const intelligence = new OnChainPatternRecognition();
@@ -26,7 +27,6 @@ const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
-const PORT = Number(process.env.PORT) || 10000;
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
 const seenTokens = new Set<string>();
