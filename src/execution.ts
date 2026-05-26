@@ -47,7 +47,6 @@ export class LowLatencyExecutionEngine {
       timeout: 8000
     });
 
-    // ✅ FIXED: Clean single implementation with Token-2022 compatibility parameters
     const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
@@ -64,42 +63,22 @@ export class LowLatencyExecutionEngine {
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const serializedTx = bs58.encode(tx.serialize());
-      const payload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "sendBundle",
-        params: [[serializedTx]]
-      };
-
-      const res = await this.client.post(this.jitoBundleEndpoint, payload, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 8000
-      });
-
+      const payload = { jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[serializedTx]] };
+      const res = await this.client.post(this.jitoBundleEndpoint, payload, { headers: { 'Content-Type': 'application/json' }, timeout: 8000 });
       if (res.data?.result) {
         const bundleId = res.data.result;
-        this.confirmJitoBundle(bundleId).then(confirmed => {
-          if (!confirmed) console.log(`⚠️ Jito bundle ${bundleId} did not confirm`);
-          else console.log(`✅ Jito bundle ${bundleId} confirmed`);
-        });
+        this.confirmJitoBundle(bundleId).catch(() => {});
         return { success: true, bundleId };
       }
-    } catch (e: any) {
-      console.log(`⚠️ Jito failed: ${e.message} — falling back`);
-    }
+    } catch (e: any) { console.log(`⚠️ Jito failed: ${e.message}`); }
     return this.fallbackToQuickNode(tx.serialize());
   }
 
   private async confirmJitoBundle(bundleId: string): Promise<boolean> {
     try {
       await new Promise(resolve => setTimeout(resolve, 5000));
-      const res = await this.client.post(
-        'https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
-        { jsonrpc: "2.0", id: 1, method: "getBundleStatuses", params: [[bundleId]] },
-        { timeout: 8000 }
-      );
-      const status = res.data?.result?.value?.[0]?.confirmation_status;
-      return status === 'confirmed' || status === 'finalized';
+      const res = await this.client.post('https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses', { jsonrpc: "2.0", id: 1, method: "getBundleStatuses", params: [[bundleId]] }, { timeout: 8000 });
+      return res.data?.result?.value?.[0]?.confirmation_status === 'confirmed';
     } catch { return false; }
   }
 
@@ -107,43 +86,9 @@ export class LowLatencyExecutionEngine {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
       if (!rpcUrl) return { success: false, error: 'No RPC URL' };
-
-      const payload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "sendTransaction",
-        params: [
-          Buffer.from(serializedTx).toString('base64'),
-          { encoding: "base64", maxRetries: 3, skipPreflight: true }
-        ]
-      };
-
-      const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
-
-      if (res.data?.result) {
-        const signature = res.data.result;
-        console.log(`📝 Tx: ${signature}`);
-        this.confirmTransaction(signature, rpcUrl);
-        return { success: true, bundleId: signature };
-      }
+      const res = await this.client.post(rpcUrl, { jsonrpc: "2.0", id: 1, method: "sendTransaction", params: [Buffer.from(serializedTx).toString('base64'), { encoding: "base64", maxRetries: 3, skipPreflight: true }] }, { timeout: 8000 });
+      if (res.data?.result) return { success: true, bundleId: res.data.result };
       return { success: false, error: res.data?.error?.message };
-    } catch (e: any) {
-      return { success: false, error: 'RPC failure' };
-    }
-  }
-
-  private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
-    for (let i = 0; i < 20; i++) {
-      try {
-        await new Promise(resolve => setTimeout(resolve, 2500));
-        const res = await this.client.post(rpcUrl, {
-          jsonrpc: "2.0", id: 1, method: "getSignatureStatuses", params: [[signature]]
-        }, { timeout: 5000 });
-        const status = res.data?.result?.value?.[0];
-        if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return true;
-        if (status?.err) return false;
-      } catch {}
-    }
-    return false;
+    } catch (e: any) { return { success: false, error: 'RPC failure' }; }
   }
 }
