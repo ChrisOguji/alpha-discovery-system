@@ -624,6 +624,33 @@ bot.command('pnl', async (ctx) => {
   );
 });
 
+bot.command('winrate', async (ctx) => {
+  if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
+
+  let totalCalls = 0;
+  let hitsPeak = 0;   // Tokens that pumped above entry
+  let hitsStopLoss = 0; // Tokens that dropped 30% or more
+
+  for (const rec of alertHistory.values()) {
+    totalCalls++;
+    // Did it pump above entry?
+    if (rec.peakPrice > rec.alertPrice) hitsPeak++;
+    // Did it hit 30% SL? (Current price is 70% or less of entry)
+    if (rec.currentPrice <= (rec.alertPrice * 0.7)) hitsStopLoss++;
+  }
+
+  const winRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
+  const slRate = ((hitsStopLoss / totalCalls) * 100).toFixed(1);
+
+  await ctx.reply(
+    `📊 *Bot Performance Summary*\n\n` +
+    `• *Total Tokens Called:* ${totalCalls}\n` +
+    `• *Pumped above entry:* ${hitsPeak} (${winRate}%)\n` +
+    `• *Hit 30% Stop Loss:* ${hitsStopLoss} (${slRate}%)\n`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 bot.action(/^pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
   const rec = alertHistory.get(address);
