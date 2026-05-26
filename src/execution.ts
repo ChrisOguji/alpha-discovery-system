@@ -66,13 +66,17 @@ export class LowLatencyExecutionEngine {
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     // Try Jito first
     try {
-      const serializedTx = bs58.encode(tx.serialize());
+            const serializedTx = bs58.encode(tx.serialize());
       const payload = {
         jsonrpc: "2.0",
         id: 1,
         method: "sendBundle",
-        params: [[serializedTx]]
+        params: [
+          [serializedTx], 
+          { encoding: "base58" }
+        ]
       };
+
 
       const res = await this.client.post(this.jitoBundleEndpoint, payload, {
         headers: { 'Content-Type': 'application/json' },
