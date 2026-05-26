@@ -51,7 +51,7 @@ export class LowLatencyExecutionEngine {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: 60000,
+      // computeUnitPriceMicroLamports: 60000,
 prioritizationFeeLamports: "auto"
 
     }, { timeout: 8000 });
