@@ -1,7 +1,7 @@
 import { TokenSignal } from './types';
 
 export class CapitalRiskEngine {
-  private MAX_SOL_ALLOCATION_PER_TRADE = 1.0;
+  private MAX_SOL_ALLOCATION_PER_TRADE = 0.01;
   private MAX_PORTFOLIO_EXPOSURE_SOL = 5.0;
   private GLOBAL_KILL_SWITCH = false;
 
@@ -15,7 +15,7 @@ export class CapitalRiskEngine {
 
     const finalSize = (signal.alphaScore > 85 && signal.rugProbability < 0.15)
       ? this.MAX_SOL_ALLOCATION_PER_TRADE
-      : this.MAX_SOL_ALLOCATION_PER_TRADE * 0.5;
+      : this.MAX_SOL_ALLOCATION_PER_TRADE; 
 
     return { allow: true, sizeSol: finalSize };
   }
