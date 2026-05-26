@@ -30,7 +30,7 @@ export class LowLatencyExecutionEngine {
     return this.wallet;
   }
 
-    public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
+  public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
     const wsolMint = 'So11111111111111111111111111111111111111112';
     const inputMint = direction === 'BUY' ? wsolMint : outputMint;
     const targetOutputMint = direction === 'BUY' ? outputMint : wsolMint;
@@ -47,6 +47,7 @@ export class LowLatencyExecutionEngine {
       timeout: 8000
     });
 
+    // ✅ FIXED: Clean single implementation with Token-2022 compatibility parameters
     const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
@@ -60,19 +61,7 @@ export class LowLatencyExecutionEngine {
     return VersionedTransaction.deserialize(swapBuffer);
   }
 
-    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
-      quoteResponse: quoteRes.data,
-      userPublicKey: this.wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: 60000
-    }, { timeout: 8000 });
-
-    const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
-    return VersionedTransaction.deserialize(swapBuffer);
-  }
-
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
-    // Try Jito first
     try {
       const serializedTx = bs58.encode(tx.serialize());
       const payload = {
@@ -89,48 +78,35 @@ export class LowLatencyExecutionEngine {
 
       if (res.data?.result) {
         const bundleId = res.data.result;
-        // ✅ Confirm in background — does not block scan
         this.confirmJitoBundle(bundleId).then(confirmed => {
-          if (!confirmed) console.log(`⚠️ Jito bundle ${bundleId} did not confirm on-chain`);
-          else console.log(`✅ Jito bundle ${bundleId} confirmed on-chain`);
+          if (!confirmed) console.log(`⚠️ Jito bundle ${bundleId} did not confirm`);
+          else console.log(`✅ Jito bundle ${bundleId} confirmed`);
         });
-        // Return immediately — don't wait for confirmation
         return { success: true, bundleId };
       }
     } catch (e: any) {
-      console.log(`⚠️ Jito failed: ${e.message} — falling back to direct RPC`);
+      console.log(`⚠️ Jito failed: ${e.message} — falling back`);
     }
-
-    // ✅ Direct RPC fallback — most reliable
     return this.fallbackToQuickNode(tx.serialize());
   }
 
-  // ✅ Jito bundle confirmation — runs in background
   private async confirmJitoBundle(bundleId: string): Promise<boolean> {
     try {
       await new Promise(resolve => setTimeout(resolve, 5000));
       const res = await this.client.post(
         'https://mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getBundleStatuses",
-          params: [[bundleId]]
-        },
+        { jsonrpc: "2.0", id: 1, method: "getBundleStatuses", params: [[bundleId]] },
         { timeout: 8000 }
       );
       const status = res.data?.result?.value?.[0]?.confirmation_status;
       return status === 'confirmed' || status === 'finalized';
-    } catch {
-      return false;
-    }
+    } catch { return false; }
   }
 
-  // ✅ Direct RPC — returns signature immediately, confirms in background
   private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
-      if (!rpcUrl) return { success: false, error: 'No RPC URL available for fallback' };
+      if (!rpcUrl) return { success: false, error: 'No RPC URL' };
 
       const payload = {
         jsonrpc: "2.0",
@@ -146,49 +122,27 @@ export class LowLatencyExecutionEngine {
 
       if (res.data?.result) {
         const signature = res.data.result;
-        console.log(`📝 Tx signature: ${signature}`);
-        console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
-
-        // ✅ Confirm in background — scan continues immediately
-        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
-          if (confirmed) console.log(`✅ Tx confirmed on-chain: ${signature}`);
-          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
-        });
-
-        // Return success immediately with signature
+        console.log(`📝 Tx: ${signature}`);
+        this.confirmTransaction(signature, rpcUrl);
         return { success: true, bundleId: signature };
       }
-
-      return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
+      return { success: false, error: res.data?.error?.message };
     } catch (e: any) {
-      return { success: false, error: 'Fallback RPC network failure' };
+      return { success: false, error: 'RPC failure' };
     }
   }
 
-  // ✅ Background confirmation — 20 attempts over 50 seconds
   private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
     for (let i = 0; i < 20; i++) {
       try {
         await new Promise(resolve => setTimeout(resolve, 2500));
         const res = await this.client.post(rpcUrl, {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignatureStatuses",
-          params: [[signature], { searchTransactionHistory: true }]
+          jsonrpc: "2.0", id: 1, method: "getSignatureStatuses", params: [[signature]]
         }, { timeout: 5000 });
-
         const status = res.data?.result?.value?.[0];
-        if (status?.confirmationStatus === 'confirmed' ||
-            status?.confirmationStatus === 'finalized') {
-          return true;
-        }
-        if (status?.err) {
-          console.log(`❌ Tx failed on-chain: ${JSON.stringify(status.err)}`);
-          return false;
-        }
-      } catch {
-        // keep polling
-      }
+        if (status?.confirmationStatus === 'confirmed' || status?.confirmationStatus === 'finalized') return true;
+        if (status?.err) return false;
+      } catch {}
     }
     return false;
   }
