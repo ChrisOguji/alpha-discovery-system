@@ -97,7 +97,7 @@ function isReversalCandidate(pair: any): boolean {
   return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
 }
 
-// ✅ NEW: Background WebSocket Listener for Pump.fun
+// ✅ Background WebSocket Listener for Pump.fun
 function startPumpPortalStream() {
     console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
     const ws = new WebSocket('wss://pumpportal.fun/api/data');
@@ -111,11 +111,10 @@ function startPumpPortalStream() {
         try {
             const token = JSON.parse(data.toString());
             if (token.mint && token.symbol) {
-                // Push to queue for the next scan() loop to pick up
                 wssPumpTokensQueue.push({
                     tokenAddress: token.mint,
                     source: 'pumpfun-new',
-                    cachedMcap: token.vSolInBondingCurve || 30000, 
+                    cachedMcap: token.vSolInBondingCurve || 30000,
                     cachedName: token.symbol,
                     createdAt: Date.now()
                 });
@@ -144,9 +143,9 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
       try {
         const pumpRes = await axios.get(
           `https://frontend-api.pump.fun/coins/${address}`,
-          { 
+          {
             timeout: 3000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' } // Anti-530 Band-Aid
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
           }
         );
         const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
@@ -160,7 +159,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   try {
     const pumpRes = await axios.get(
       `https://frontend-api.pump.fun/coins/${address}`,
-      { 
+      {
         timeout: 4000,
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
       }
@@ -296,12 +295,11 @@ async function scan() {
       console.log(`⚠️ PumpSwap failed: ${psErr.message}`);
     }
 
-    // ── SOURCE 3: pump.fun newest tokens (NOW WSS POWERED) ──
+    // ── SOURCE 3: pump.fun newest tokens (WSS powered) ──
     let newPumpTokens: any[] = [];
     try {
-      // Drain the queue of tokens collected via WSS since the last minute
       newPumpTokens = [...wssPumpTokensQueue];
-      wssPumpTokensQueue.length = 0; // Clear the queue for the next cycle
+      wssPumpTokensQueue.length = 0;
       console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
     } catch (nErr: any) {
       console.log(`⚠️ Pump.fun WSS queue error: ${nErr.message}`);
@@ -457,7 +455,11 @@ async function scan() {
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
-              executionState = `✅ Auto\\-Buy Executed`;
+              // ✅ Show Solscan link with real transaction signature
+              const txLink = result.bundleId
+                ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})`
+                : '';
+              executionState = `✅ Auto\\-Buy Executed${txLink}`;
               executedSizeSol = risk.sizeSol;
               executedPrice = currentPrice;
               if (executedPrice > 0) {
@@ -560,10 +562,10 @@ bot.launch({
   webhook: { domain: DOMAIN, port: PORT }
 }).then(() => {
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
-  
-  // ✅ NEW: Start the WebSocket listener on launch
-  startPumpPortalStream(); 
-  
+
+  // ✅ Start WebSocket listener on launch
+  startPumpPortalStream();
+
   scan();
   setInterval(scan, 60000);
 
