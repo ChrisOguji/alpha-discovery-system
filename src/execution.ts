@@ -30,7 +30,6 @@ export class LowLatencyExecutionEngine {
     return this.wallet;
   }
 
-  public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
     public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
     const wsolMint = 'So11111111111111111111111111111111111111112';
     const inputMint = direction === 'BUY' ? wsolMint : outputMint;
@@ -48,7 +47,6 @@ export class LowLatencyExecutionEngine {
       timeout: 8000
     });
 
-    // ✅ FIXED: Added dynamicSlippage and auto prioritization for Token-2022 compatibility
     const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
