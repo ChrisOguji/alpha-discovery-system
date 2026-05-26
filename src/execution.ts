@@ -4,13 +4,14 @@ import bs58 from 'bs58';
 import * as https from 'https';
 
 export class LowLatencyExecutionEngine {
-  private jupiterUrl = 'https://quote-api.jup.ag/v6';
+  private jupiterUrl = process.env.QUICKNODE_RPC_URL
+    ? `${process.env.QUICKNODE_RPC_URL}addon/200/v6`
+    : 'https://quote-api.jup.ag/v6';
   private jitoBundleEndpoint = 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
   private wallet: Keypair;
 
-  // IPv4 forcing and browser spoofing to bypass Render/Cloudflare blocks
   private client = axios.create({
-    httpsAgent: new https.Agent({ family: 4 }), 
+    httpsAgent: new https.Agent({ family: 4 }),
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'application/json'
@@ -52,7 +53,7 @@ export class LowLatencyExecutionEngine {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
-      computeUnitPriceMicroLamports: 60000 
+      computeUnitPriceMicroLamports: 60000
     }, { timeout: 8000 });
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
@@ -62,7 +63,7 @@ export class LowLatencyExecutionEngine {
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const serializedTx = bs58.encode(tx.serialize());
-      
+
       const payload = {
         jsonrpc: "2.0",
         id: 1,
@@ -76,12 +77,10 @@ export class LowLatencyExecutionEngine {
       });
 
       if (res.data?.result) return { success: true, bundleId: res.data.result };
-      
-      // Fallback protocol: Jito rejected the bundle (likely due to missing tip), routing directly to RPC
+
       return this.fallbackToQuickNode(tx.serialize());
-      
+
     } catch (e: any) {
-      // Network drop, immediate fallback
       return this.fallbackToQuickNode(tx.serialize());
     }
   }
@@ -90,7 +89,7 @@ export class LowLatencyExecutionEngine {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
       if (!rpcUrl) return { success: false, error: 'No RPC URL available for fallback' };
-      
+
       const payload = {
         jsonrpc: "2.0",
         id: 1,
@@ -103,7 +102,7 @@ export class LowLatencyExecutionEngine {
 
       const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
       if (res.data?.result) return { success: true };
-      
+
       return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
     } catch (e: any) {
       return { success: false, error: 'Fallback RPC network failure' };
