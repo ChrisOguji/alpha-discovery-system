@@ -8,6 +8,19 @@ import { LowLatencyExecutionEngine } from './execution';
 import { TokenSignal } from './types';
 import Redis from 'ioredis';
 const redis = new Redis(process.env.REDIS_URL || '');
+import express from 'express';
+
+// ✅ FAKE WEB SERVER TO KEEP RENDER AWAKE
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.get('/ping', (req, res) => {
+  res.status(200).send('Degen Sniper is awake and hunting! 🎯');
+});
+
+app.listen(port, () => {
+  console.log(`🌐 Anti-Sleep Server running on port ${port}`);
+});
 
 dotenv.config();
 
