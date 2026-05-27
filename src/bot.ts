@@ -782,7 +782,6 @@ bot.action(/^pnl_period_(.+)$/, async (ctx) => {
 });
 
 bot.command('winrate', async (ctx) => {
-bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
 
   let totalCalls = 0;
