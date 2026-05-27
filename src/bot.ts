@@ -22,9 +22,8 @@ const executor = new LowLatencyExecutionEngine();
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
-// ✅ FIX 1: TTL-based seenTokens — tokens expire after 2 hours instead of blocking forever
-const seenTokens = new Map<string, number>(); // address -> timestamp when seen
-const SEEN_TOKEN_TTL = 2 * 60 * 60 * 1000; // 2 hours
+const seenTokens = new Map<string, number>();
+const SEEN_TOKEN_TTL = 2 * 60 * 60 * 1000;
 
 function markTokenSeen(address: string) {
   seenTokens.set(address, Date.now());
@@ -33,7 +32,6 @@ function markTokenSeen(address: string) {
 function isTokenSeen(address: string): boolean {
   const seenAt = seenTokens.get(address);
   if (!seenAt) return false;
-  // If older than TTL, remove it and treat as unseen
   if (Date.now() - seenAt > SEEN_TOKEN_TTL) {
     seenTokens.delete(address);
     return false;
@@ -41,15 +39,13 @@ function isTokenSeen(address: string): boolean {
   return true;
 }
 
-// Periodically clean up expired entries to prevent memory bloat
 setInterval(() => {
   const now = Date.now();
   for (const [addr, ts] of seenTokens.entries()) {
     if (now - ts > SEEN_TOKEN_TTL) seenTokens.delete(addr);
   }
-}, 30 * 60 * 1000); // every 30 minutes
+}, 30 * 60 * 1000);
 
-// ✅ NEW: WebSocket Queue for Pump.fun tokens
 const wssPumpTokensQueue: any[] = [];
 
 interface Position {
@@ -77,12 +73,9 @@ interface AlertRecord {
 }
 let alertHistory = new Map<string, AlertRecord>();
 
-// ✅ FIX 2: Load positions from Supabase on startup (survives deploys)
 async function loadPositionsFromDb() {
   try {
-    const result = await db.query(
-      `SELECT * FROM active_positions WHERE status = 'OPEN'`
-    );
+    const result = await db.query(`SELECT * FROM active_positions WHERE status = 'OPEN'`);
     for (const row of result.rows) {
       openPositions.set(row.token_address, {
         ticker: row.ticker,
@@ -117,10 +110,7 @@ async function savePositionToDb(address: string, pos: Position) {
 
 async function closePositionInDb(address: string) {
   try {
-    await db.query(
-      `UPDATE active_positions SET status = 'CLOSED' WHERE token_address = $1`,
-      [address]
-    );
+    await db.query(`UPDATE active_positions SET status = 'CLOSED' WHERE token_address = $1`, [address]);
   } catch (err: any) {
     console.log(`⚠️ DB close position error: ${err.message}`);
   }
@@ -155,7 +145,8 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  if (mcap >= 1000 && mcap <= 40000) score += 25;
+  // ✅ Updated: 70k max
+  if (mcap >= 1000 && mcap <= 70000) score += 25;
   if (liquidity >= 25000) score += 20;
   else if (liquidity >= 10000) score += 12;
   else if (liquidity >= 5000) score += 6;
@@ -187,16 +178,13 @@ function isReversalCandidate(pair: any): boolean {
   return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
 }
 
-// ✅ Background WebSocket Listener for Pump.fun
 function startPumpPortalStream() {
   console.log("🔗 Connecting to PumpPortal WSS (Bypassing Cloudflare)...");
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
-
   ws.on('open', () => {
     console.log("🟢 WSS Connected! Streaming new token launches...");
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
-
   ws.on('message', (data: any) => {
     try {
       const token = JSON.parse(data.toString());
@@ -211,35 +199,24 @@ function startPumpPortalStream() {
       }
     } catch (e) {}
   });
-
   ws.on('close', () => {
     console.log("🔴 WSS Disconnected. Reconnecting...");
     setTimeout(startPumpPortalStream, 5000);
   });
-
-  ws.on('error', (err: any) => {
-    console.error("⚠️ WSS Error:", err.message);
-  });
+  ws.on('error', (err: any) => console.error("⚠️ WSS Error:", err.message));
 }
 
 async function getLivePrice(address: string): Promise<{ price: number; mcap: number }> {
   try {
-    const jupRes = await axios.get(
-      `https://api.jup.ag/price/v2?ids=${address}`,
-      { timeout: 4000 }
-    );
+    const jupRes = await axios.get(`https://api.jup.ag/price/v2?ids=${address}`, { timeout: 4000 });
     const jupPrice = parseFloat(jupRes.data?.data?.[address]?.price || '0');
     if (jupPrice > 0) {
       try {
-        const pumpRes = await axios.get(
-          `https://frontend-api.pump.fun/coins/${address}`,
-          {
-            timeout: 3000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
-          }
-        );
-        const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
-        return { price: jupPrice, mcap };
+        const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
+          timeout: 3000,
+          headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
+        });
+        return { price: jupPrice, mcap: parseFloat(pumpRes.data?.usd_market_cap || '0') };
       } catch {
         return { price: jupPrice, mcap: 0 };
       }
@@ -247,23 +224,17 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   } catch {}
 
   try {
-    const pumpRes = await axios.get(
-      `https://frontend-api.pump.fun/coins/${address}`,
-      {
-        timeout: 4000,
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
-      }
-    );
+    const pumpRes = await axios.get(`https://frontend-api.pump.fun/coins/${address}`, {
+      timeout: 4000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
+    });
     const price = parseFloat(pumpRes.data?.price || pumpRes.data?.sol_price || '0');
     const mcap = parseFloat(pumpRes.data?.usd_market_cap || '0');
     if (price > 0) return { price, mcap };
   } catch {}
 
   try {
-    const dexRes = await axios.get(
-      `https://api.dexscreener.com/latest/dex/tokens/${address}`,
-      { timeout: 5000 }
-    );
+    const dexRes = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 5000 });
     const pair = dexRes.data?.pairs?.[0];
     const price = parseFloat(pair?.priceUsd || '0');
     const mcap = parseFloat(pair?.fdv || pair?.marketCap || '0');
@@ -274,13 +245,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
 }
 
 async function monitorPositions() {
-  // ✅ FIX 3: Monitor ALL alerts in history — no 24-hour cutoff
-  // Peak tracking works from the original alert price forever
-  const allAddresses = new Set([
-    ...openPositions.keys(),
-    ...alertHistory.keys()
-  ]);
-
+  const allAddresses = new Set([...openPositions.keys(), ...alertHistory.keys()]);
   if (allAddresses.size === 0) return;
 
   await Promise.all(Array.from(allAddresses).map(async (address) => {
@@ -307,7 +272,6 @@ async function monitorPositions() {
         if (currentPrice > pos.peakPrice) updated.peakPrice = currentPrice;
         openPositions.set(address, updated);
 
-        // ✅ Also update peak in DB
         try {
           await db.query(
             `UPDATE active_positions SET current_price_usd = $1, highest_price_usd = $2 WHERE token_address = $3`,
@@ -329,23 +293,20 @@ async function monitorPositions() {
         if (exitReason) {
           const pnlSol = (pos.sizeSol * pnlPct) / 100;
           const msg = [
-            `💰 *POSITION CLOSED*`,
-            ``,
+            `💰 *POSITION CLOSED*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
-            `*Address:* \`${address}\``,
-            ``,
+            `*Address:* \`${address}\``, ``,
             `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
             `*Exit Price:* $${currentPrice.toFixed(8)}`,
             `*PnL:* ${pnlPct >= 0 ? '🟢' : '🔴'} ${pnlPct.toFixed(2)}%`,
             `*PnL in SOL:* ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
             `*Size:* ${pos.sizeSol} SOL`,
-            `*Held:* ${holdingMins} minutes`,
-            ``,
+            `*Held:* ${holdingMins} minutes`, ``,
             exitReason,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          await closePositionInDb(address); // ✅ Mark closed in DB too
+          await closePositionInDb(address);
           console.log(`✅ Closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
         }
       }
@@ -354,7 +315,6 @@ async function monitorPositions() {
     }
   }));
 
-  // ✅ Save updated peaks to Redis after each monitoring cycle
   await saveHistory();
 }
 
@@ -362,100 +322,59 @@ async function scan() {
   console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
-    // ── SOURCE 1: DexScreener profiles ──
-    const profilesRes = await axios.get(
-      'https://api.dexscreener.com/token-profiles/latest/v1',
-      { timeout: 10000 }
-    );
+    const profilesRes = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 });
     const profiles = profilesRes.data || [];
     const pumpProfiles = profiles
       .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
       .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
 
-    // ── SOURCE 2: PumpSwap pairs ──
     let pumpSwapProfiles: any[] = [];
     try {
-      const pumpSwapRes = await axios.get(
-        'https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun',
-        { timeout: 10000 }
-      );
-      const pumpSwapPairs = pumpSwapRes.data?.pairs || [];
-      pumpSwapProfiles = pumpSwapPairs
+      const pumpSwapRes = await axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun', { timeout: 10000 });
+      pumpSwapProfiles = (pumpSwapRes.data?.pairs || [])
         .filter((p: any) => p.baseToken?.address && p.chainId === 'solana')
-        .map((p: any) => ({
-          tokenAddress: p.baseToken.address,
-          source: 'pumpswap',
-          cachedPair: p
-        }));
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'pumpswap', cachedPair: p }));
       console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
-    } catch (psErr: any) {
-      console.log(`⚠️ PumpSwap failed: ${psErr.message}`);
-    }
+    } catch (psErr: any) { console.log(`⚠️ PumpSwap failed: ${psErr.message}`); }
 
-    // ── SOURCE 3: pump.fun newest tokens (WSS powered) ──
     let newPumpTokens: any[] = [];
     try {
       newPumpTokens = [...wssPumpTokensQueue];
       wssPumpTokensQueue.length = 0;
       console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
-    } catch (nErr: any) {
-      console.log(`⚠️ Pump.fun WSS queue error: ${nErr.message}`);
-    }
+    } catch (nErr: any) { console.log(`⚠️ WSS queue error: ${nErr.message}`); }
 
-    // ── SOURCE 4: DexScreener new pairs (last 2hrs) ──
     let newDexPairs: any[] = [];
     try {
-      const newPairsRes = await axios.get(
-        'https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana',
-        { timeout: 10000 }
-      );
-      const pairs = newPairsRes.data?.pairs || [];
-      newDexPairs = pairs
+      const newPairsRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana', { timeout: 10000 });
+      newDexPairs = (newPairsRes.data?.pairs || [])
         .filter((p: any) =>
           p.baseToken?.address?.endsWith('pump') &&
           p.chainId === 'solana' &&
           p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000
         )
-        .map((p: any) => ({
-          tokenAddress: p.baseToken.address,
-          source: 'dex-new',
-          cachedPair: p
-        }));
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'dex-new', cachedPair: p }));
       console.log(`New DEX pairs: ${newDexPairs.length} (last 2hrs)`);
-    } catch (dErr: any) {
-      console.log(`⚠️ New DEX pairs failed: ${dErr.message}`);
-    }
+    } catch (dErr: any) { console.log(`⚠️ New DEX pairs failed: ${dErr.message}`); }
 
-    // ── SOURCE 5: Momentum reversals ──
     let reversalTokens: any[] = [];
     try {
-      const reversalRes = await axios.get(
-        'https://api.dexscreener.com/latest/dex/search?q=solana&chainIds=solana',
-        { timeout: 10000 }
-      );
-      const allPairs = reversalRes.data?.pairs || [];
-      reversalTokens = allPairs
+      const reversalRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=solana&chainIds=solana', { timeout: 10000 });
+      reversalTokens = (reversalRes.data?.pairs || [])
         .filter((p: any) =>
           p.baseToken?.address?.endsWith('pump') &&
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 40000
+          // ✅ Updated: 70k max
+          parseFloat(p.fdv || p.marketCap || '0') <= 70000
         )
-        .map((p: any) => ({
-          tokenAddress: p.baseToken.address,
-          source: 'reversal',
-          cachedPair: p
-        }));
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
-    } catch (rErr: any) {
-      console.log(`⚠️ Reversal scan failed: ${rErr.message}`);
-    }
+    } catch (rErr: any) { console.log(`⚠️ Reversal scan failed: ${rErr.message}`); }
 
-    // ── MERGE + DEDUPLICATE all 5 sources ──
     const localSeen = new Set<string>();
     const allCandidates: any[] = [];
-
     for (const p of [...newPumpTokens, ...newDexPairs, ...reversalTokens, ...pumpSwapProfiles, ...pumpProfiles]) {
       if (!localSeen.has(p.tokenAddress)) {
         localSeen.add(p.tokenAddress);
@@ -468,30 +387,21 @@ async function scan() {
     for (const p of allCandidates.slice(0, 40)) {
       try {
         await new Promise(resolve => setTimeout(resolve, 800));
-
-        // ✅ FIX 1: Use TTL-based check instead of permanent Set
         if (isTokenSeen(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
         if (!pair) {
           try {
-            const { data } = await axios.get(
-              `https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`,
-              { timeout: 8000 }
-            );
+            const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
             pair = data?.pairs?.[0];
           } catch {
-            markTokenSeen(p.tokenAddress); // ✅ TTL-based
+            markTokenSeen(p.tokenAddress);
             continue;
           }
         }
 
-        let mcap = pair
-          ? parseFloat(pair.fdv || pair.marketCap || '0')
-          : (p.cachedMcap || 0);
-        let liquidity = pair
-          ? parseFloat(pair.liquidity?.usd || '0')
-          : 0;
+        let mcap = pair ? parseFloat(pair.fdv || pair.marketCap || '0') : (p.cachedMcap || 0);
+        let liquidity = pair ? parseFloat(pair.liquidity?.usd || '0') : 0;
         const ticker = pair?.baseToken?.symbol || p.cachedName || 'UNKNOWN';
         const address = pair?.baseToken?.address || p.tokenAddress;
         const creatorAddress = pair?.info?.deployer || undefined;
@@ -504,8 +414,9 @@ async function scan() {
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
-        if (mcap < mcapMin || mcap > 40000) {
-          markTokenSeen(p.tokenAddress); // ✅ TTL-based
+        // ✅ Updated: 70k max
+        if (mcap < mcapMin || mcap > 70000) {
+          markTokenSeen(p.tokenAddress);
           continue;
         }
 
@@ -515,18 +426,11 @@ async function scan() {
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
-        if (alphaScore < scoreMin) {
-          markTokenSeen(p.tokenAddress); // ✅ TTL-based
-          continue;
-        }
+        if (alphaScore < scoreMin) { markTokenSeen(p.tokenAddress); continue; }
 
         const signal: TokenSignal = {
-          tokenAddress: address,
-          ticker,
-          alphaScore,
-          rugProbability: rugProb,
-          liquidityUsd: liquidity,
-          marketCapUsd: mcap,
+          tokenAddress: address, ticker, alphaScore,
+          rugProbability: rugProb, liquidityUsd: liquidity, marketCapUsd: mcap,
         };
 
         const [pattern, risk] = await Promise.all([
@@ -536,7 +440,7 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          markTokenSeen(p.tokenAddress); // ✅ TTL-based
+          markTokenSeen(p.tokenAddress);
           continue;
         }
 
@@ -553,22 +457,17 @@ async function scan() {
             tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
-              const txLink = result.bundleId
-                ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})`
-                : '';
+              const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
               executionState = `✅ Auto\\-Buy Executed${txLink}`;
               executedSizeSol = risk.sizeSol;
               executedPrice = currentPrice;
               if (executedPrice > 0) {
                 const pos: Position = {
-                  ticker, address,
-                  entryPrice: executedPrice,
-                  peakPrice: executedPrice,
-                  sizeSol: executedSizeSol,
-                  entryTime: Date.now()
+                  ticker, address, entryPrice: executedPrice,
+                  peakPrice: executedPrice, sizeSol: executedSizeSol, entryTime: Date.now()
                 };
                 openPositions.set(address, pos);
-                await savePositionToDb(address, pos); // ✅ Persist to Supabase
+                await savePositionToDb(address, pos);
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
               }
             } else {
@@ -576,30 +475,31 @@ async function scan() {
             }
           } catch (execErr: any) {
             console.log("🔥 AUTO-BUY REJECTION REASON:", JSON.stringify(execErr.response?.data || execErr.message));
-
             const isNetworkErr = execErr.message?.includes('ENOTFOUND') || execErr.message?.includes('ECONNREFUSED');
             executionState = isNetworkErr
               ? `⏸ Execution Paused: Jupiter unreachable on free tier`
               : `❌ Execution Blocked: ${escapeText(execErr.message)}`;
           }
-
         } else {
           executionState = `❌ Auto\\-Buy Blocked: ${escapeText(risk.reason || '')}`;
         }
 
-        alertHistory.set(address, {
-          ticker, address,
-          alertTime: Date.now(),
-          alertMcap: mcap,
-          alertPrice: currentPrice,
-          peakMcap: mcap,
-          peakPrice: currentPrice,
-          peakTime: Date.now(),
-          currentMcap: mcap,
-          currentPrice,
-          lastUpdated: Date.now()
-        });
-        await saveHistory();
+        // ✅ Only create new record if not already tracked — preserves original alertTime
+        if (!alertHistory.has(address)) {
+          alertHistory.set(address, {
+            ticker, address,
+            alertTime: Date.now(),
+            alertMcap: mcap,
+            alertPrice: currentPrice,
+            peakMcap: mcap,
+            peakPrice: currentPrice,
+            peakTime: Date.now(),
+            currentMcap: mcap,
+            currentPrice,
+            lastUpdated: Date.now()
+          });
+          await saveHistory();
+        }
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
         const sourceLabel: Record<string, string> = {
@@ -615,18 +515,15 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`,
-          ``,
+          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
-          ...reversalLine,
-          ``,
+          ...reversalLine, ``,
           `🤖 *Execution State:*`,
-          executionState,
-          ``,
+          executionState, ``,
           `👾 *Deployer Metrics:*`,
           `• Wallet: \`${walletShort}\``,
           `• Bundled Launch: ${pattern.isBundledLaunch ? '⚠️ Yes' : '✅ No'}`,
@@ -635,21 +532,19 @@ async function scan() {
           `• Wash Trading: ${pattern.washTradingDetected ? '⚠️ Detected' : '✅ Clean'}`,
           `• Unique Buyers: ${pattern.uniqueBuyers} \\(${pattern.buyerVelocity} velocity\\)`,
           `• Smart Money: ${pattern.smartCohortPresence ? '✅ Present' : '➖ None'}`,
-          `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '✅ Confirmed'}`,
-          ``,
+          `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '✅ Confirmed'}`, ``,
           `📊 *AI Intelligence Matrix:*`,
           `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
           `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
           `• Dev Rug History: ${pattern.devRugHistoryCount} prior rugs`,
-          `• Dynamic Mode: ${getDynamicMode(alphaScore)}`,
-          ``,
+          `• Dynamic Mode: ${getDynamicMode(alphaScore)}`, ``,
           `📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`,
         ].join('\n');
 
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        markTokenSeen(p.tokenAddress); // ✅ TTL-based
+        markTokenSeen(p.tokenAddress);
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
@@ -664,18 +559,11 @@ bot.launch({
   webhook: { domain: DOMAIN, port: PORT }
 }).then(async () => {
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
-
-  // ✅ Load persisted positions from Supabase on startup
   await loadPositionsFromDb();
-
-  // ✅ Start WebSocket listener on launch
   startPumpPortalStream();
-
   scan();
   setInterval(scan, 60000);
-
   setInterval(monitorPositions, 30 * 1000);
-
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
@@ -703,12 +591,10 @@ bot.command('positions', async (ctx) => {
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
-// ✅ FIX 4: /pnl command with time period grouping
 bot.command('pnl', async (ctx) => {
   if (alertHistory.size === 0) {
     return ctx.reply('📭 No alerts recorded yet. Wait for the bot to call some tokens.');
   }
-
   await ctx.reply(
     '📊 *Select a time period:*',
     {
@@ -733,7 +619,6 @@ bot.action(/^pnl_period_(.+)$/, async (ctx) => {
 
   switch (period) {
     case 'today':
-      // Start of today UTC
       const todayStart = new Date();
       todayStart.setUTCHours(0, 0, 0, 0);
       cutoff = todayStart.getTime();
@@ -758,47 +643,33 @@ bot.action(/^pnl_period_(.+)$/, async (ctx) => {
     .filter(([_, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime);
 
-  if (filtered.length === 0) {
-    return ctx.reply(`📭 No alerts found for period: ${periodLabel}`);
-  }
+  if (filtered.length === 0) return ctx.reply(`📭 No alerts found for period: ${periodLabel}`);
 
-  const buttons = filtered
-    .slice(0, 20)
-    .map(([address, rec]) => {
-      const pnlPct = rec.peakPrice > rec.alertPrice
-        ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
-        : '0';
-      const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
-      return [Markup.button.callback(label, `pnl_${address}`)];
-    });
+  const buttons = filtered.slice(0, 20).map(([address, rec]) => {
+    const pnlPct = rec.peakPrice > rec.alertPrice
+      ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
+      : '0';
+    const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
+    return [Markup.button.callback(label, `pnl_${address}`)];
+  });
 
   await ctx.reply(
     `📊 *PnL — ${escapeText(periodLabel)}* (${filtered.length} tokens)`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard(buttons)
-    }
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
   );
 });
 
 bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
 
-  let totalCalls = 0;
-  let hitsPeak = 0;
-  let hitsStopLoss = 0;
-  let totalGainPct = 0;
-  let totalLossPct = 0;
+  let totalCalls = 0, hitsPeak = 0, hitsStopLoss = 0, totalGainPct = 0, totalLossPct = 0;
 
   for (const rec of alertHistory.values()) {
     totalCalls++;
-
     if (rec.peakPrice > rec.alertPrice) {
       hitsPeak++;
-      const gainPct = ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
-      totalGainPct += gainPct;
+      totalGainPct += ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
     }
-
     if (rec.currentPrice <= (rec.alertPrice * 0.7)) {
       hitsStopLoss++;
       totalLossPct += 30;
@@ -810,35 +681,29 @@ bot.command('winrate', async (ctx) => {
   const netPnl = totalGainPct - totalLossPct;
   const avgPerTrade = (netPnl / totalCalls).toFixed(1);
   const winRate = totalGainPct + totalLossPct > 0
-    ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1)
-    : '0.0';
+    ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1) : '0.0';
 
   const netEmoji = netPnl >= 0 ? '🟢' : '🔴';
   const winEmoji = parseFloat(winRate) >= 50 ? '🟢' : '🔴';
   const avgEmoji = parseFloat(avgPerTrade) >= 0 ? '🟢' : '🔴';
 
-  const lines = [
-    `📊 *Bot Performance Summary*`,
-    ``,
+  await ctx.reply([
+    `📊 *Bot Performance Summary*`, ``,
     `• *Total Tokens Called:* ${totalCalls}`,
     `• *Pumped Above Entry:* ${hitsPeak}`,
     `• *Hit 30% Stop Loss:* ${hitsStopLoss}`,
-    `• *Neutral (no move):* ${neutrals}`,
-    `• *Hit Rate:* ${hitsPeak}/${totalCalls} (${hitRate}%)`,
-    ``,
+    `• *Neutral \\(no move\\):* ${neutrals}`,
+    `• *Hit Rate:* ${hitsPeak}/${totalCalls} \\(${hitRate}%\\)`, ``,
     `💹 *Net Gain:* 🟢 +${totalGainPct.toFixed(1)}%`,
-    `🔻 *Net Loss:* 🔴 -${totalLossPct.toFixed(1)}%`,
+    `🔻 *Net Loss:* 🔴 \\-${totalLossPct.toFixed(1)}%`,
     `📉 *Net PnL:* ${netEmoji} ${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(1)}%`,
     `🎯 *Avg Per Trade:* ${avgEmoji} ${parseFloat(avgPerTrade) >= 0 ? '+' : ''}${avgPerTrade}%`,
     `📈 *Win Rate:* ${winEmoji} ${winRate}%`,
-  ];
-
-  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+  ].join('\n'), { parse_mode: 'Markdown' });
 });
 
 bot.action(/^pnl_(.+)$/, async (ctx) => {
   const address = ctx.match[1];
-  // Skip if it's a period selection (already handled above)
   if (address.startsWith('period_')) return;
 
   const rec = alertHistory.get(address);
@@ -848,25 +713,19 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   const alertDate = new Date(rec.alertTime).toUTCString();
   const peakDate = new Date(rec.peakTime).toUTCString();
   const peakPnlPct = rec.peakPrice > 0 && rec.alertPrice > 0
-    ? ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100
-    : 0;
+    ? ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100 : 0;
   const currentPnlPct = rec.currentPrice > 0 && rec.alertPrice > 0
-    ? ((rec.currentPrice - rec.alertPrice) / rec.alertPrice) * 100
-    : 0;
+    ? ((rec.currentPrice - rec.alertPrice) / rec.alertPrice) * 100 : 0;
   const peakMcapGain = rec.alertMcap > 0
-    ? ((rec.peakMcap - rec.alertMcap) / rec.alertMcap) * 100
-    : 0;
+    ? ((rec.peakMcap - rec.alertMcap) / rec.alertMcap) * 100 : 0;
   const neverPumped = rec.peakPrice <= rec.alertPrice;
 
   const lines = [
-    `📊 *PnL Report: $${escapeText(rec.ticker)}*`,
-    ``,
+    `📊 *PnL Report: $${escapeText(rec.ticker)}*`, ``,
     `*Address:* \`${address}\``,
-    `*Alerted:* ${escapeText(alertDate)}`,
-    ``,
+    `*Alerted:* ${escapeText(alertDate)}`, ``,
     `*MCAP at Alert:* $${rec.alertMcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-    `*Price at Alert:* $${rec.alertPrice.toFixed(8)}`,
-    ``,
+    `*Price at Alert:* $${rec.alertPrice.toFixed(8)}`, ``,
   ];
 
   if (neverPumped) {
@@ -888,26 +747,13 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
 
   lines.push(``);
   lines.push(`📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`);
-
   await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
-// --- HEARTBEAT TIMER ---
+// ✅ Heartbeat — console only, NOT Telegram
 setInterval(() => {
-  const chatID = process.env.TELEGRAM_CHAT_ID;
-
-  if (chatID) {
-    bot.telegram.sendMessage(
-      chatID,
-      "⏱️ *Heartbeat:* Bot is awake and monitoring the market...",
-      { parse_mode: 'Markdown' }
-    ).catch((err: any) => console.log("Heartbeat error:", err.message));
-  } else {
-    console.log("Error: TELEGRAM_CHAT_ID environment variable is missing.");
-  }
-
+  console.log('⏱️ Heartbeat: Bot is awake and monitoring the market...');
 }, 15 * 60 * 1000);
-
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
