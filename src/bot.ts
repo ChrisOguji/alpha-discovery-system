@@ -33,6 +33,10 @@ interface Position {
   peakPrice: number;
   sizeSol: number;
   entryTime: number;
+  // ── Dynamic trailing stop loss state ──
+  stopLossLevel: 'initial' | 'breakeven' | 'trailing';
+  stopLossPct: number; // current stop loss % relative to entry (negative = below entry)
+  remainingPct: number; // remaining position size (starts at 100)
 }
 const openPositions = new Map<string, Position>();
 
@@ -275,21 +279,88 @@ async function monitorPositions() {
         const pos = openPositions.get(address)!;
         const updated = { ...pos };
         if (currentPrice > pos.peakPrice) updated.peakPrice = currentPrice;
-        openPositions.set(address, updated);
 
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-        const dropFromPeak = ((currentPrice - updated.peakPrice) / updated.peakPrice) * 100;
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
-        let exitReason = '';
-        if (pnlPct >= 100) exitReason = '🎯 TAKE PROFIT — 2x Hit';
-        else if (pnlPct <= -30) exitReason = '🛑 STOP LOSS — \\-30% Hit';
-        else if (updated.peakPrice > pos.entryPrice * 1.3 && dropFromPeak <= -20) {
-          exitReason = '📉 TRAILING STOP — 20% Drop From Peak';
+        // ── DYNAMIC TRAILING STOP LOSS ──
+        // Level 1: profit hits +10% to +15% → move stop loss to -10% below entry
+        if (pnlPct >= 10 && updated.stopLossLevel === 'initial') {
+          updated.stopLossLevel = 'breakeven';
+          updated.stopLossPct = -10;
+          console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
+          await bot.telegram.sendMessage(CHAT_ID,
+            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -10% below entry\n*Protected from:* full loss`,
+            { parse_mode: 'Markdown' }
+          );
         }
 
-        if (exitReason) {
-          const pnlSol = (pos.sizeSol * pnlPct) / 100;
+        // Level 2: profit hits +25% to +30% → move stop loss to +2% above entry
+        if (pnlPct >= 25 && updated.stopLossLevel === 'breakeven') {
+          updated.stopLossLevel = 'trailing';
+          updated.stopLossPct = 2;
+          console.log(`🔒 ${pos.ticker} stop loss moved to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
+          await bot.telegram.sendMessage(CHAT_ID,
+            `🔐 *STOP LOSS IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+
+        // ── STAGED TAKE PROFIT ──
+        // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
+        let tpMsg = '';
+        let soldPct = 0;
+
+        if (pnlPct >= 100 && updated.remainingPct > 40) {
+          soldPct = 60;
+          updated.remainingPct = 40;
+          tpMsg = `🎯 *TAKE PROFIT 1 — +100%*\n• Sold: 60% of position\n• Remaining: 40%\n• Next TP: +250%`;
+        } else if (pnlPct >= 250 && updated.remainingPct > 25) {
+          soldPct = 15;
+          updated.remainingPct = 25;
+          tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
+        } else if (pnlPct >= 500 && updated.remainingPct > 10) {
+          soldPct = 15;
+          updated.remainingPct = 10;
+          tpMsg = `🎯 *TAKE PROFIT 3 — +500%*\n• Sold: 15% of position\n• Remaining: 10%\n• Next TP: +900%`;
+        } else if (pnlPct >= 900 && updated.remainingPct > 0) {
+          soldPct = 10;
+          updated.remainingPct = 0;
+          tpMsg = `🎯 *TAKE PROFIT 4 — +900%*\n• Sold: final 10% of position\n• Position fully closed`;
+        }
+
+        if (tpMsg) {
+          const pnlSol = (pos.sizeSol * (soldPct / 100) * pnlPct) / 100;
+          const fullMsg = [
+            tpMsg, ``,
+            `*Token:* $${escapeText(pos.ticker)}`,
+            `*Entry:* $${pos.entryPrice.toFixed(8)}`,
+            `*Current:* $${currentPrice.toFixed(8)}`,
+            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
+            `*Profit taken:* +${pnlSol.toFixed(4)} SOL`,
+          ].join('\n');
+          await bot.telegram.sendMessage(CHAT_ID, fullMsg, { parse_mode: 'Markdown' });
+
+          // If fully exited
+          if (updated.remainingPct === 0) {
+            openPositions.delete(address);
+            console.log(`✅ Position fully closed: ${pos.ticker} at +${pnlPct.toFixed(1)}%`);
+            openPositions.set(address, updated);
+            return;
+          }
+        }
+
+        // ── STOP LOSS CHECK — uses dynamic level ──
+        const stopLossPrice = pos.entryPrice * (1 + updated.stopLossPct / 100);
+        const stopLossHit = currentPrice <= stopLossPrice;
+
+        if (stopLossHit && updated.remainingPct > 0) {
+          const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
+          const stopLabel =
+            updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
+            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
+            '🛑 STOP LOSS — -30% Hit';
+
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
@@ -300,19 +371,21 @@ async function monitorPositions() {
             `*PnL in SOL:* ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
             `*Size:* ${pos.sizeSol} SOL`,
             `*Held:* ${holdingMins} minutes`, ``,
-            exitReason,
+            stopLabel,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
-          console.log(`✅ Closed: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          return;
         }
+
+        openPositions.set(address, updated);
       }
     } catch (err: any) {
       console.log(`❌ Monitor error ${address}: ${err.message}`);
     }
   }));
 
-  // Save updated peaks to storage
   await saveHistory();
 }
 
@@ -415,7 +488,7 @@ async function scan() {
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-        const scoreMin = isNew ? 75 : 85;
+        const scoreMin = isNew ? 70 : 75;
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
@@ -456,8 +529,15 @@ async function scan() {
               executedPrice = currentPrice;
               if (executedPrice > 0) {
                 openPositions.set(address, {
-                  ticker, address, entryPrice: executedPrice,
-                  peakPrice: executedPrice, sizeSol: executedSizeSol, entryTime: Date.now()
+                  ticker, address,
+                  entryPrice: executedPrice,
+                  peakPrice: executedPrice,
+                  sizeSol: executedSizeSol,
+                  entryTime: Date.now(),
+                  // ── Start with initial stop loss at -30% ──
+                  stopLossLevel: 'initial',
+                  stopLossPct: -30,
+                  remainingPct: 100,
                 });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
               }
@@ -588,7 +668,6 @@ bot.launch({
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
-      // ✅ Heartbeat to console only — not Telegram
       console.log('🏓 Self-ping sent — bot is alive');
     } catch {}
   }, 5 * 60 * 1000);
@@ -608,10 +687,49 @@ bot.command('positions', async (ctx) => {
     lines.push(`• $${escapeText(pos.ticker)} — ${pos.sizeSol} SOL — ${mins}m held`);
     lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
     lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
+    lines.push(`  Stop Loss: ${pos.stopLossPct >= 0 ? '+' : ''}${pos.stopLossPct}% (${pos.stopLossLevel})`);
+    lines.push(`  Remaining: ${pos.remainingPct}%`);
     lines.push('');
   }
   ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
+
+// ── Helper: build collective PnL token list for a period ──
+async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
+  const now = Date.now();
+  const periodMs: Record<string, number> = {
+    daily: 24 * 60 * 60 * 1000,
+    weekly: 7 * 24 * 60 * 60 * 1000,
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    lifetime: Infinity
+  };
+  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
+  const filtered = Array.from(alertHistory.entries())
+    .filter(([, rec]) => rec.alertTime >= cutoff)
+    .sort((a, b) => b[1].alertTime - a[1].alertTime)
+    .slice(0, 20);
+
+  const periodLabel: Record<string, string> = {
+    daily: '📅 Daily', weekly: '📆 Weekly',
+    monthly: '🗓 Monthly', lifetime: '🏆 Lifetime'
+  };
+
+  const buttons = filtered.map(([address, rec]) => {
+    const pnlPct = rec.peakPrice > rec.alertPrice
+      ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
+      : '0';
+    const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
+    return [Markup.button.callback(label, `pnl_${address}`)];
+  });
+
+  // Add refresh button at the bottom
+  buttons.push([Markup.button.callback('🔄 Refresh', `period_${period}`)]);
+
+  return {
+    text: `📊 *${periodLabel[period]} Calls \\(${filtered.length} tokens\\):*`,
+    buttons
+  };
+}
 
 // ✅ /pnl — period selector first, then token list
 bot.command('pnl', async (ctx) => {
@@ -632,79 +750,72 @@ bot.command('pnl', async (ctx) => {
   );
 });
 
-// ✅ Period selector handler
+// ✅ Period selector handler — also handles Refresh button on collective PnL
 bot.action(/^period_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+  await ctx.answerCbQuery("Refreshing...");
   const period = ctx.match[1];
-  const now = Date.now();
-
-  const periodMs: Record<string, number> = {
-    daily: 24 * 60 * 60 * 1000,
-    weekly: 7 * 24 * 60 * 60 * 1000,
-    monthly: 30 * 24 * 60 * 60 * 1000,
-    lifetime: Infinity
-  };
-
-  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
-
-  const filtered = Array.from(alertHistory.entries())
-    .filter(([, rec]) => rec.alertTime >= cutoff)
-    .sort((a, b) => b[1].alertTime - a[1].alertTime)
-    .slice(0, 20);
-
-  if (filtered.length === 0) {
-    return ctx.reply(`📭 No alerts found for the selected period.`);
+  const { text, buttons } = await buildPeriodPnlMessage(period);
+  // buttons.length === 1 means only the refresh button, no tokens found
+  if (buttons.length <= 1) {
+    try { await ctx.editMessageText("📭 No alerts found for the selected period."); } catch {}
+    return;
   }
-
-  const periodLabel: Record<string, string> = {
-    daily: '📅 Daily', weekly: '📆 Weekly',
-    monthly: '🗓 Monthly', lifetime: '🏆 Lifetime'
-  };
-
-  const buttons = filtered.map(([address, rec]) => {
-    const pnlPct = rec.peakPrice > rec.alertPrice
-      ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)
-      : '0';
-    const label = `$${rec.ticker} | Peak: +${pnlPct}%`;
-    return [Markup.button.callback(label, `pnl_${address}`)];
-  });
-
-  await ctx.reply(
-    `📊 *${periodLabel[period]} Calls \\(${filtered.length} tokens\\):*`,
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard(buttons)
-    }
-  );
+  try {
+    await ctx.editMessageText(text, { parse_mode: "Markdown", ...Markup.inlineKeyboard(buttons) });
+  } catch {}
 });
 
 bot.command('winrate', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No data to analyze yet.');
 
   let totalCalls = 0, hitsPeak = 0, hitsStopLoss = 0;
+  let totalGainPct = 0, totalLossPct = 0;
+
   for (const rec of alertHistory.values()) {
     totalCalls++;
-    if (rec.peakPrice > rec.alertPrice) hitsPeak++;
-    if (rec.currentPrice <= (rec.alertPrice * 0.7)) hitsStopLoss++;
+    if (rec.peakPrice > rec.alertPrice) {
+      hitsPeak++;
+      totalGainPct += ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
+    }
+    if (rec.currentPrice <= (rec.alertPrice * 0.7)) {
+      hitsStopLoss++;
+      totalLossPct += 30;
+    }
   }
 
-  const winRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
-  const slRate = ((hitsStopLoss / totalCalls) * 100).toFixed(1);
+  const neutrals = Math.max(0, totalCalls - hitsPeak - hitsStopLoss);
+  const hitRate = ((hitsPeak / totalCalls) * 100).toFixed(1);
+  const netPnl = totalGainPct - totalLossPct;
+  const avgPerTrade = (netPnl / totalCalls).toFixed(1);
+  const winRate = totalGainPct + totalLossPct > 0
+    ? ((totalGainPct / (totalGainPct + totalLossPct)) * 100).toFixed(1)
+    : '0.0';
 
-  await ctx.reply(
-    `📊 *Bot Performance Summary*\n\n` +
-    `• *Total Tokens Called:* ${totalCalls}\n` +
-    `• *Pumped above entry:* ${hitsPeak} \\(${winRate}%\\)\n` +
-    `• *Hit 30% Stop Loss:* ${hitsStopLoss} \\(${slRate}%\\)\n`,
-    { parse_mode: 'Markdown' }
-  );
+  const netEmoji = netPnl >= 0 ? '🟢' : '🔴';
+  const winEmoji = parseFloat(winRate) >= 50 ? '🟢' : '🔴';
+  const avgEmoji = parseFloat(avgPerTrade) >= 0 ? '🟢' : '🔴';
+
+  const lines = [
+    `📊 *Bot Performance Summary*`, ``,
+    `• *Total Tokens Called:* ${totalCalls}`,
+    `• *Pumped Above Entry:* ${hitsPeak}`,
+    `• *Hit 30% Stop Loss:* ${hitsStopLoss}`,
+    `• *Neutral (no move):* ${neutrals}`,
+    `• *Hit Rate:* ${hitsPeak}/${totalCalls} (${hitRate}%)`, ``,
+    `💹 *Net Gain:* 🟢 +${totalGainPct.toFixed(1)}%`,
+    `🔻 *Net Loss:* 🔴 -${totalLossPct.toFixed(1)}%`,
+    `📉 *Net PnL:* ${netEmoji} ${netPnl >= 0 ? '+' : ''}${netPnl.toFixed(1)}%`,
+    `🎯 *Avg Per Trade:* ${avgEmoji} ${parseFloat(avgPerTrade) >= 0 ? '+' : ''}${avgPerTrade}%`,
+    `📈 *Win Rate:* ${winEmoji} ${winRate}%`,
+  ];
+
+  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
 });
 
-bot.action(/^pnl_(.+)$/, async (ctx) => {
-  const address = ctx.match[1];
+// ── Helper: build single token PnL message + buttons ──
+async function buildTokenPnlMessage(address: string): Promise<{ text: string; buttons: any[] } | null> {
   const rec = alertHistory.get(address);
-  if (!rec) return ctx.answerCbQuery('Token not found in history.');
-  await ctx.answerCbQuery();
+  if (!rec) return null;
 
   const alertDate = new Date(rec.alertTime).toUTCString();
   const peakDate = new Date(rec.peakTime).toUTCString();
@@ -744,7 +855,53 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   lines.push(``);
   lines.push(`📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`);
 
-  await ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+  const buttons = [
+    [Markup.button.callback('🔄 Refresh', `refresh_pnl_${address}`)]
+  ];
+
+  return { text: lines.join('\n'), buttons };
+}
+
+bot.action(/^pnl_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  const result = await buildTokenPnlMessage(address);
+  if (!result) return ctx.answerCbQuery('Token not found in history.');
+  await ctx.answerCbQuery();
+
+  await ctx.reply(result.text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(result.buttons)
+  });
+});
+
+// ✅ Refresh handler for individual token PnL
+bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
+  const address = ctx.match[1];
+  await ctx.answerCbQuery('Refreshing...');
+
+  // Fetch latest price before rebuilding
+  try {
+    const { price: currentPrice, mcap: currentMcap } = await getLivePrice(address);
+    if (currentPrice && alertHistory.has(address)) {
+      const rec = alertHistory.get(address)!;
+      const updated = { ...rec, currentPrice, currentMcap, lastUpdated: Date.now() };
+      if (currentPrice > rec.peakPrice) {
+        updated.peakPrice = currentPrice;
+        updated.peakMcap = currentMcap;
+        updated.peakTime = Date.now();
+      }
+      alertHistory.set(address, updated);
+      await saveHistory();
+    }
+  } catch {}
+
+  const result = await buildTokenPnlMessage(address);
+  if (!result) return;
+
+  await ctx.editMessageText(result.text, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard(result.buttons)
+  });
 });
 
 // ✅ Heartbeat — console only, NOT Telegram
