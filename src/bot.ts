@@ -485,7 +485,15 @@ async function scan() {
         const mcapMin = isNew ? 500 : 1000;
 
         if (mcap < mcapMin || mcap > 40000) { seenTokens.add(p.tokenAddress); continue; }
-
+// ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+if (!isNew && pair?.pairCreatedAt) {
+  const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
+  if (ageMinutes < 7) {
+    console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
+    seenTokens.add(p.tokenAddress);
+    continue;
+  }
+}
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
         const scoreMin = isNew ? 70 : 75;
