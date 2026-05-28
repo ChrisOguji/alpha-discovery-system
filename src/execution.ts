@@ -43,7 +43,8 @@ export class LowLatencyExecutionEngine {
         outputMint: targetOutputMint,
         amount: computedUnits,
         slippageBps: 2000,
-        onlyDirectRoutes: true
+        onlyDirectRoutes: false,
+        dynamicSlippage: true
       },
       timeout: 8000
     });
