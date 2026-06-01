@@ -218,7 +218,8 @@ export class OnChainPatternRecognition {
 }
 
   // ── MAIN ANALYSIS ──
-  public async analyzePattern(signal: TokenSignal, creatorAddress?: string): Promise<PatternMetrics> {
+  // ── FIX 3: Accept isNew flag to skip LOW_BUYER_VELOCITY gate for brand new tokens ──
+  public async analyzePattern(signal: TokenSignal, creatorAddress?: string, isNew = false): Promise<PatternMetrics> {
     try {
       console.log(`🧠 Analysing ${signal.ticker}...`);
 
@@ -262,15 +263,16 @@ export class OnChainPatternRecognition {
       };
 
       // ── Gates ──
-if (!isPump) return { ...base, reason: 'NOT_PUMPFUN_TOKEN' };
-if (topConcentration > 0.60) return { ...base, reason: 'TOP_HOLDERS_EXCEED_60PCT' };
-if (bundled) return { ...base, reason: 'BUNDLED_LAUNCH_DETECTED' };
-if (washTrading) return { ...base, reason: 'WASH_TRADING_DETECTED' };
-if (deployerHistory.rugCount >= 2) return { ...base, reason: `DEPLOYER_${deployerHistory.rugCount}_RUGS` };
-if (buyerVelocity.velocity === 'LOW') return { ...base, reason: 'LOW_BUYER_VELOCITY' };
+      if (!isPump) return { ...base, reason: 'NOT_PUMPFUN_TOKEN' };
+      if (topConcentration > 0.60) return { ...base, reason: 'TOP_HOLDERS_EXCEED_60PCT' };
+      if (bundled) return { ...base, reason: 'BUNDLED_LAUNCH_DETECTED' };
+      if (washTrading) return { ...base, reason: 'WASH_TRADING_DETECTED' };
+      if (deployerHistory.rugCount >= 2) return { ...base, reason: `DEPLOYER_${deployerHistory.rugCount}_RUGS` };
+      // ── FIX 3: Skip LOW_BUYER_VELOCITY gate for new tokens — they have no Helius history yet ──
+      if (!isNew && buyerVelocity.velocity === 'LOW') return { ...base, reason: 'LOW_BUYER_VELOCITY' };
 
-// ── Rug probability hard reject — number 1 ──
-if (signal.rugProbability > 0.20) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
+      // ── Rug probability hard reject — number 1 ──
+      if (signal.rugProbability > 0.20) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
       
       console.log(`✅ ${signal.ticker} PASSED | Buyers: ${buyerVelocity.uniqueBuyers} | Top5: ${concentrationPct}% | Smart: ${smartMoney}`);
       return { ...base, passedPatterns: true };
