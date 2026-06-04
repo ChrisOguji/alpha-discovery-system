@@ -53,6 +53,40 @@ export async function initDatabaseSchema() {
       );
     `);
 
+    // ── Trades Log — full trade lifecycle tracking ──
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS trades_log (
+        id SERIAL PRIMARY KEY,
+        address TEXT NOT NULL,
+        ticker TEXT,
+        source TEXT,
+        alert_time BIGINT,
+        alert_price NUMERIC,
+        alert_mcap NUMERIC,
+        entry_price NUMERIC,
+        entry_size_sol NUMERIC,
+        peak_price NUMERIC,
+        peak_mcap NUMERIC,
+        peak_time BIGINT,
+        peak_gain_pct NUMERIC,
+        exit_price NUMERIC,
+        exit_time BIGINT,
+        exit_type TEXT,
+        pnl_pct NUMERIC,
+        pnl_sol NUMERIC,
+        held_minutes INTEGER,
+        alpha_score NUMERIC,
+        rug_probability NUMERIC,
+        unique_buyers INTEGER,
+        buyer_velocity TEXT,
+        top_holder_pct NUMERIC,
+        is_bundled_launch BOOLEAN,
+        wash_trading BOOLEAN,
+        smart_money BOOLEAN,
+        status TEXT DEFAULT 'ALERTED'
+      );
+    `);
+
     console.log("⚡ Supabase Tables & High-Performance Schema Verified.");
   } catch (err) {
     console.error("❌ Database initialization failure:", err);
