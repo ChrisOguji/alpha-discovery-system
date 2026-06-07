@@ -8,7 +8,7 @@ export class CapitalRiskEngine {
   public async validateExecutionRisk(signal: TokenSignal): Promise<{ allow: boolean; sizeSol: number; reason?: string }> {
     if (this.GLOBAL_KILL_SWITCH) return { allow: false, sizeSol: 0, reason: 'GLOBAL_RISK_KILL_SWITCH_ACTIVE' };
     if (signal.marketCapUsd < 1000) return { allow: false, sizeSol: 0, reason: 'MCAP_BELOW_1K_LIMIT' };
-    if (signal.marketCapUsd > 70000) return { allow: false, sizeSol: 0, reason: 'MCAP_ABOVE_70K_LIMIT' };
+    if (signal.marketCapUsd > 30000) return { allow: false, sizeSol: 0, reason: 'MCAP_ABOVE_30K_LIMIT' };
     if (signal.alphaScore < 70) return { allow: false, sizeSol: 0, reason: 'ALPHA_SCORE_BELOW_MINIMUM' };
     if (signal.rugProbability > 0.30) return { allow: false, sizeSol: 0, reason: 'RUG_PROBABILITY_TOO_HIGH' };
     if (signal.liquidityUsd < 6000) return { allow: false, sizeSol: 0, reason: 'LIQUIDITY_POOL_UNSAFE' };
