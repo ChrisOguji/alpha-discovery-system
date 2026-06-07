@@ -272,7 +272,7 @@ export class OnChainPatternRecognition {
       if (!isNew && buyerVelocity.velocity === 'LOW') return { ...base, reason: 'LOW_BUYER_VELOCITY' };
 
       // ── Rug probability hard reject — number 1 ──
-      if (signal.rugProbability > 0.20) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
+      if (signal.rugProbability > 0.15) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
       
       console.log(`✅ ${signal.ticker} PASSED | Buyers: ${buyerVelocity.uniqueBuyers} | Top5: ${concentrationPct}% | Smart: ${smartMoney}`);
       return { ...base, passedPatterns: true };
