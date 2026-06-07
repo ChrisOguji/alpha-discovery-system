@@ -264,7 +264,7 @@ export class OnChainPatternRecognition {
 
       // ── Gates ──
       if (!isPump) return { ...base, reason: 'NOT_PUMPFUN_TOKEN' };
-      if (topConcentration > 0.60) return { ...base, reason: 'TOP_HOLDERS_EXCEED_60PCT' };
+      if (topConcentration > 0.55) return { ...base, reason: 'TOP_HOLDERS_EXCEED_55PCT' };
       if (bundled) return { ...base, reason: 'BUNDLED_LAUNCH_DETECTED' };
       if (washTrading) return { ...base, reason: 'WASH_TRADING_DETECTED' };
       if (deployerHistory.rugCount >= 2) return { ...base, reason: `DEPLOYER_${deployerHistory.rugCount}_RUGS` };
@@ -272,7 +272,7 @@ export class OnChainPatternRecognition {
       if (!isNew && buyerVelocity.velocity === 'LOW') return { ...base, reason: 'LOW_BUYER_VELOCITY' };
 
       // ── Rug probability hard reject — number 1 ──
-      if (signal.rugProbability > 0.20) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
+      if (signal.rugProbability > 0.15) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
       
       console.log(`✅ ${signal.ticker} PASSED | Buyers: ${buyerVelocity.uniqueBuyers} | Top5: ${concentrationPct}% | Smart: ${smartMoney}`);
       return { ...base, passedPatterns: true };
