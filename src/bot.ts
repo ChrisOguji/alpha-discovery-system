@@ -16,6 +16,8 @@ dotenv.config();
 const PORT = Number(process.env.PORT) || 10000;
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN || '');
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+
 // ── Security: only respond in authorized chat ──
 bot.use(async (ctx, next) => {
   const chatId = ctx.chat?.id?.toString();
@@ -28,11 +30,23 @@ bot.use(async (ctx, next) => {
 const intelligence = new OnChainPatternRecognition();
 const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
-
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const DOMAIN = process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 
-const seenTokens = new Set<string>();
+// ── seenTokens with 30-min TTL ──
+const seenTokens = new Map<string, number>(); // address -> timestamp
+const SEEN_TTL = 30 * 60 * 1000; // 30 minutes
+
+function markSeen(addr: string) { seenTokens.set(addr, Date.now()); }
+function isSeen(addr: string): boolean {
+  const t = seenTokens.get(addr);
+  if (!t) return false;
+  if (Date.now() - t > SEEN_TTL) { seenTokens.delete(addr); return false; }
+  return true;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [a, t] of seenTokens.entries()) if (now - t > SEEN_TTL) seenTokens.delete(a);
+}, 10 * 60 * 1000);
 const wssPumpTokensQueue: any[] = [];
 
 interface Position {
@@ -489,16 +503,21 @@ async function scan() {
   console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
-    const profilesRes = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 });
-    const profiles = profilesRes.data || [];
+    // ── Parallel fetch: profiles + pumpswap ──
+    const [profilesRes, pumpSwapResParallel] = await Promise.allSettled([
+      axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 }),
+      axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun', { timeout: 10000 })
+    ]);
+
+    const profiles = profilesRes.status === 'fulfilled' ? (profilesRes.value.data || []) : [];
     const pumpProfiles = profiles
       .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
       .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
 
     let pumpSwapProfiles: any[] = [];
     try {
-      const pumpSwapRes = await axios.get('https://api.dexscreener.com/latest/dex/pairs/solana/pumpfun', { timeout: 10000 });
-      pumpSwapProfiles = (pumpSwapRes.data?.pairs || [])
+      const pumpSwapData = pumpSwapResParallel.status === 'fulfilled' ? pumpSwapResParallel.value : null;
+      pumpSwapProfiles = (pumpSwapData?.data?.pairs || [])
         .filter((p: any) => p.baseToken?.address && p.chainId === 'solana')
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'pumpswap', cachedPair: p }));
       console.log(`PumpSwap: ${pumpSwapProfiles.length} pairs`);
@@ -511,30 +530,61 @@ async function scan() {
       console.log(`Pump.fun new (via WSS): ${newPumpTokens.length} tokens`);
     } catch (nErr: any) { console.log(`⚠️ WSS queue error: ${nErr.message}`); }
 
-    let newDexPairs: any[] = [];
+    let newDexPairs: any[] = []; // populated inside early-momentum block below
+
+    // ── SOURCE: Early Momentum — reuse newDexPairs data, $1k–$8k mcap, volume spike ──
+    let earlyMomentumTokens: any[] = [];
     try {
-      const newPairsRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana', { timeout: 10000 });
-      newDexPairs = (newPairsRes.data?.pairs || [])
+      const newPairsResAll = await axios.get('https://api.dexscreener.com/latest/dex/search?q=pump.fun&chainIds=solana', { timeout: 10000 });
+      const allNewPairs = newPairsResAll.data?.pairs || [];
+
+      // newDexPairs: $500+ mcap, created < 2hrs — already set above
+      // earlyMomentum: subset with volume spike signal
+      earlyMomentumTokens = allNewPairs
+        .filter((p: any) => {
+          const eMcap = parseFloat(p.fdv || p.marketCap || '0');
+          const eVolH1 = parseFloat(p.volume?.h1 || '0');
+          const eVolH6 = parseFloat(p.volume?.h6 || '0');
+          const volumeSpike = eVolH1 > 0 && eVolH6 > 0 && (eVolH1 / (eVolH6 / 6)) > 2.5;
+          const recentBuys = parseFloat(p.txns?.h1?.buys || '0') >= 10;
+          return p.baseToken?.address?.endsWith('pump') &&
+            p.chainId === 'solana' &&
+            eMcap >= 1000 && eMcap <= 8000 &&
+            volumeSpike && recentBuys &&
+            p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000;
+        })
+        .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'early-momentum', cachedPair: p }));
+      console.log(`Early momentum: ${earlyMomentumTokens.length}`);
+
+      // Also update newDexPairs from the same response to save an API call
+      newDexPairs = allNewPairs
         .filter((p: any) =>
           p.baseToken?.address?.endsWith('pump') &&
           p.chainId === 'solana' &&
           p.pairCreatedAt && (Date.now() - p.pairCreatedAt) < 2 * 60 * 60 * 1000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'dex-new', cachedPair: p }));
-      console.log(`New DEX pairs: ${newDexPairs.length}`);
-    } catch (dErr: any) { console.log(`⚠️ New DEX pairs failed: ${dErr.message}`); }
+      console.log(`New DEX pairs (refreshed): ${newDexPairs.length}`);
+
+    } catch (emErr: any) { console.log(`⚠️ Early momentum failed: ${emErr.message}`); }
 
     let reversalTokens: any[] = [];
     try {
       const reversalRes = await axios.get('https://api.dexscreener.com/latest/dex/search?q=solana&chainIds=solana', { timeout: 10000 });
       reversalTokens = (reversalRes.data?.pairs || [])
-        .filter((p: any) =>
-          p.baseToken?.address?.endsWith('pump') &&
-          p.chainId === 'solana' &&
-          isReversalCandidate(p) &&
-          parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 40000
-        )
+        .filter((p: any) => {
+          const rMcap = parseFloat(p.fdv || p.marketCap || '0');
+          const rLiq = parseFloat(p.liquidity?.usd || '0');
+          const volH24 = parseFloat(p.volume?.h24 || '0');
+          const volH6 = parseFloat(p.volume?.h6 || '0');
+          const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.40;
+          return p.baseToken?.address?.endsWith('pump') &&
+            p.chainId === 'solana' &&
+            isReversalCandidate(p) &&
+            volumeReturning &&
+            rMcap >= 1000 && rMcap <= 28000 &&
+            rLiq >= 8000; // min $8k real liquidity for reversals
+        })
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
     } catch (rErr: any) { console.log(`⚠️ Reversal scan failed: ${rErr.message}`); }
@@ -543,6 +593,7 @@ async function scan() {
     const prioritized = [
       ...newPumpTokens,
       ...newDexPairs,
+      ...earlyMomentumTokens,
       ...reversalTokens,
       ...pumpSwapProfiles,
       ...pumpProfiles
@@ -550,19 +601,45 @@ async function scan() {
 
     console.log(`Total candidates: ${prioritized.length} across 5 sources`);
 
-    for (const p of prioritized.slice(0, 40)) {
+    for (const p of prioritized.slice(0, 60)) {
       try {
-        await new Promise(resolve => setTimeout(resolve, 800));
-        if (seenTokens.has(p.tokenAddress)) continue;
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (isSeen(p.tokenAddress)) continue;
 
         let pair = p.cachedPair || null;
         if (!pair) {
-          try {
-            const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
-            pair = data?.pairs?.[0];
-          } catch {
-            seenTokens.add(p.tokenAddress);
-            continue;
+          // ── WSS new tokens: fetch real data from pump.fun API first ──
+          if (p.source === 'pumpfun-new') {
+            try {
+              const pumpApiRes = await axios.get(`https://frontend-api.pump.fun/coins/${p.tokenAddress}`, {
+                timeout: 4000,
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36' }
+              });
+              const pData = pumpApiRes.data;
+              if (pData?.usd_market_cap) {
+                // Build a minimal pair-like object from pump.fun data
+                pair = {
+                  baseToken: { address: p.tokenAddress, symbol: pData.symbol || p.cachedName },
+                  priceUsd: String(pData.price || '0'),
+                  fdv: String(pData.usd_market_cap || '0'),
+                  marketCap: String(pData.usd_market_cap || '0'),
+                  liquidity: { usd: String(pData.virtual_sol_reserves ? pData.virtual_sol_reserves * 0.15 : 0) },
+                  pairCreatedAt: pData.created_timestamp ? pData.created_timestamp * 1000 : Date.now(),
+                  priceChange: { h24: '0', h6: '0', h1: '0' },
+                  volume: { h24: '0', h6: '0', h1: '0' },
+                  info: { deployer: pData.creator }
+                };
+              }
+            } catch {}
+          }
+          if (!pair) {
+            try {
+              const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${p.tokenAddress}`, { timeout: 8000 });
+              pair = data?.pairs?.[0];
+            } catch {
+              markSeen(p.tokenAddress);
+              continue;
+            }
           }
         }
 
@@ -574,14 +651,25 @@ async function scan() {
         const currentPrice = parseFloat(pair?.priceUsd || '0');
 
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
-        if (!mcap) { seenTokens.add(p.tokenAddress); continue; }
 
-        const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
+        // ── Post-bond tokens (pumpswap/profiles): require real $10k+ liquidity ──
+        const isPostBond = p.source === 'pumpswap' || p.source === 'profiles';
+        if (isPostBond && liquidity < 10000) {
+          console.log(`⏭ ${ticker} post-bond low liq: $${liquidity.toFixed(0)}, skipping`);
+          continue;
+        }
+        // ── Post-bond mcap range: $3k–$28k ──
+        if (isPostBond && (mcap < 3000 || mcap > 28000)) {
+          continue;
+        }
+        if (!mcap) { markSeen(p.tokenAddress); continue; }
+
+        const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new' || p.source === 'early-momentum';
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 500 : 1000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 40000) continue;
+        if (mcap < mcapMin || mcap > 28000) continue;
 
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
@@ -595,7 +683,7 @@ async function scan() {
 
         const rugProb = computeRugProbability(mcap, liquidity);
         const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
-        const scoreMin = isNew ? 70 : 75;
+        const scoreMin = isNew ? 70 : (p.source === 'reversal' ? 75 : 75);
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
@@ -615,7 +703,7 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          seenTokens.add(p.tokenAddress);
+          markSeen(p.tokenAddress);
           continue;
         }
 
@@ -718,7 +806,8 @@ async function scan() {
           'dex-new': '⚡ New DEX Pair',
           'pumpswap': '🔄 PumpSwap',
           'profiles': '📈 Trending',
-          'reversal': '🔄 Reversal \\(Retraced & Building\\)'
+          'reversal': '🔄 Reversal \\(Retraced & Building\\)',
+          'early-momentum': '🚀 Early Momentum \\(Volume Spike\\)'
         };
 
         const reversalLine = isReversal
@@ -755,8 +844,7 @@ async function scan() {
         await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
         console.log(`✅ Alert sent: ${ticker} — Score: ${alphaScore}/100 — Source: ${p.source}`);
 
-        seenTokens.add(p.tokenAddress);
-        if (seenTokens.size > 500) seenTokens.clear();
+        markSeen(p.tokenAddress);
 
       } catch (innerErr: any) {
         console.log(`❌ Error on token: ${innerErr.message}`);
