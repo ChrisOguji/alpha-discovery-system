@@ -751,13 +751,18 @@ function getPeriodDateString(period: string): string {
 
 async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
   const now = Date.now();
-  const periodMs: Record<string, number> = {
-    daily: 24 * 60 * 60 * 1000,
-    weekly: 7 * 24 * 60 * 60 * 1000,
-    monthly: 30 * 24 * 60 * 60 * 1000,
-    lifetime: Infinity
-  };
-  const cutoff = period === 'lifetime' ? 0 : now - periodMs[period];
+  let cutoff: number;
+if (period === 'daily') {
+  const todayUTC = new Date();
+  todayUTC.setUTCHours(0, 0, 0, 0);
+  cutoff = todayUTC.getTime();
+} else if (period === 'weekly') {
+  cutoff = now - 7 * 24 * 60 * 60 * 1000;
+} else if (period === 'monthly') {
+  cutoff = now - 30 * 24 * 60 * 60 * 1000;
+} else {
+  cutoff = 0;
+}
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
