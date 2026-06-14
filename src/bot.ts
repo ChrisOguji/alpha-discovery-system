@@ -42,30 +42,12 @@ interface Position {
   peakPrice: number;
   sizeSol: number;
   entryTime: number;
-  // ── Flat stop loss — single level only ──
-  stopLossLevel: 'initial';
-  stopLossPct: number; // always -20% below entry
-  remainingPct: number; // always 100 until closed
+  // ── Dynamic trailing stop loss state ──
+  stopLossLevel: 'initial' | 'breakeven' | 'trailing';
+  stopLossPct: number; // current stop loss % relative to entry (negative = below entry)
+  remainingPct: number; // remaining position size (starts at 100)
 }
 const openPositions = new Map<string, Position>();
-
-// ── Watchlist: tokens above $10k mcap awaiting +5% confirmation ──
-interface WatchlistEntry {
-  ticker: string;
-  address: string;
-  mcap: number;
-  liquidity: number;
-  alphaScore: number;
-  rugProb: number;
-  watchPrice: number; // price when added to watchlist
-  addedAt: number;
-  source: string;
-  h24: number;
-  h1: number;
-  pattern: any;
-  risk: any;
-}
-const watchlist = new Map<string, WatchlistEntry>();
 
 interface AlertRecord {
   ticker: string;
@@ -155,80 +137,6 @@ async function saveHistory() {
     }
   } catch (e: any) {
     console.log(`⚠️ Supabase save failed: ${e.message}`);
-  }
-}
-
-// ── Trade logging helpers ──
-async function logTradeAlert(params: {
-  address: string; ticker: string; source: string;
-  alertPrice: number; alertMcap: number; entryPrice: number; entrySizeSol: number;
-  alphaScore: number; rugProbability: number; uniqueBuyers: number;
-  buyerVelocity: string; topHolderPct: number; isBundledLaunch: boolean;
-  washTrading: boolean; smartMoney: boolean;
-}) {
-  try {
-    await db.query(`
-      INSERT INTO trades_log (
-        address, ticker, source, alert_time, alert_price, alert_mcap,
-        entry_price, entry_size_sol, peak_price, peak_mcap,
-        alpha_score, rug_probability, unique_buyers, buyer_velocity,
-        top_holder_pct, is_bundled_launch, wash_trading, smart_money, status
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'OPEN')
-      ON CONFLICT DO NOTHING
-    `, [
-      params.address, params.ticker, params.source, Date.now(),
-      params.alertPrice, params.alertMcap,
-      params.entryPrice > 0 ? params.entryPrice : null,
-      params.entrySizeSol > 0 ? params.entrySizeSol : null,
-      params.alertPrice, params.alertMcap,
-      params.alphaScore, params.rugProbability,
-      params.uniqueBuyers, params.buyerVelocity,
-      params.topHolderPct, params.isBundledLaunch,
-      params.washTrading, params.smartMoney
-    ]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade log insert failed: ${e.message}`);
-  }
-}
-
-async function updateTradePeak(address: string, peakPrice: number, peakMcap: number) {
-  try {
-    await db.query(`
-      UPDATE trades_log SET
-        peak_price = GREATEST(COALESCE(peak_price, 0), $2),
-        peak_mcap  = GREATEST(COALESCE(peak_mcap, 0), $3),
-        peak_time  = CASE WHEN $2 > COALESCE(peak_price, 0) THEN $4 ELSE peak_time END,
-        peak_gain_pct = CASE WHEN alert_price > 0
-          THEN ROUND((($2 - alert_price) / alert_price * 100)::numeric, 2)
-          ELSE peak_gain_pct END
-      WHERE address = $1 AND status = 'OPEN'
-    `, [address, peakPrice, peakMcap, Date.now()]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade peak update failed: ${e.message}`);
-  }
-}
-
-async function closeTrade(address: string, exitPrice: number, exitType: string, sizeSol: number) {
-  try {
-    await db.query(`
-      UPDATE trades_log SET
-        exit_price    = $2,
-        exit_time     = $3,
-        exit_type     = $4,
-        status        = 'CLOSED',
-        pnl_pct       = CASE WHEN entry_price > 0
-                          THEN ROUND((($2 - entry_price) / entry_price * 100)::numeric, 2)
-                          ELSE NULL END,
-        pnl_sol       = CASE WHEN entry_price > 0
-                          THEN ROUND((($2 - entry_price) / entry_price * $5)::numeric, 6)
-                          ELSE NULL END,
-        held_minutes  = CASE WHEN alert_time > 0
-                          THEN FLOOR(($3 - alert_time) / 60000)
-                          ELSE NULL END
-      WHERE address = $1 AND status = 'OPEN'
-    `, [address, exitPrice, Date.now(), exitType, sizeSol]);
-  } catch (e: any) {
-    console.log(`⚠️ Trade close failed: ${e.message}`);
   }
 }
 
@@ -372,8 +280,6 @@ async function monitorPositions() {
           updated.peakMcap = currentMcap;
           updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
-          // ── Update trade log peak ──
-          await updateTradePeak(address, currentPrice, currentMcap);
         }
         alertHistory.set(address, updated);
       }
@@ -386,47 +292,99 @@ async function monitorPositions() {
         const pnlPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
-        // ── TAKE PROFIT: sell 100% at +100% ──
-        if (pnlPct >= 100) {
-          const pnlSol = (pos.sizeSol * pnlPct) / 100;
-          const tpMsg = [
-            `🎯 *TAKE PROFIT — +100%*`, ``,
-            `*Token:* $${escapeText(pos.ticker)}`,
-            `*Address:* \`${address}\``, ``,
-            `*Entry:* $${pos.entryPrice.toFixed(8)}`,
-            `*Exit:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
-            `*Profit taken:* +${pnlSol.toFixed(4)} SOL`,
-            `*Held:* ${holdingMins} minutes`,
-            `*Position:* 100% sold`,
-          ].join('\n');
-          await bot.telegram.sendMessage(CHAT_ID, tpMsg, { parse_mode: 'Markdown' });
-          await closeTrade(address, currentPrice, 'TAKE_PROFIT_100PCT', pos.sizeSol);
-          openPositions.delete(address);
-          console.log(`✅ Take profit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
-          return;
+        // ── DYNAMIC TRAILING STOP LOSS ──
+        // Level 1: profit hits +15% → move stop loss to -10% below entry
+        if (pnlPct >= 15 && updated.stopLossLevel === 'initial') {
+          updated.stopLossLevel = 'breakeven';
+          updated.stopLossPct = -10;
+          console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
+          await bot.telegram.sendMessage(CHAT_ID,
+            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -10% below entry\n*Protected from:* full loss`,
+            { parse_mode: 'Markdown' }
+          );
         }
 
-        // ── STOP LOSS: flat -20% below entry ──
-        const stopLossPrice = pos.entryPrice * 0.80;
-        if (currentPrice <= stopLossPrice) {
-          const pnlSol = (pos.sizeSol * pnlPct) / 100;
+        // Level 2: profit hits +60% → move stop loss to +2% above entry (locks in profit)
+        if (pnlPct >= 60 && updated.stopLossLevel === 'breakeven') {
+          updated.stopLossLevel = 'trailing';
+          updated.stopLossPct = 2;
+          console.log(`🔐 ${pos.ticker} stop loss locked to +2% above entry (profit: +${pnlPct.toFixed(1)}%)`);
+          await bot.telegram.sendMessage(CHAT_ID,
+            `🔐 *STOP LOSS LOCKED IN PROFIT*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* +2% above entry\n*This trade cannot lose now*`,
+            { parse_mode: 'Markdown' }
+          );
+        }
+
+        // ── STAGED TAKE PROFIT ──
+        // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
+        let tpMsg = '';
+        let soldPct = 0;
+
+        if (pnlPct >= 100 && updated.remainingPct > 40) {
+          soldPct = 60;
+          updated.remainingPct = 40;
+          tpMsg = `🎯 *TAKE PROFIT 1 — +100%*\n• Sold: 60% of position\n• Remaining: 40%\n• Next TP: +250%`;
+        } else if (pnlPct >= 250 && updated.remainingPct > 25) {
+          soldPct = 15;
+          updated.remainingPct = 25;
+          tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
+        } else if (pnlPct >= 500 && updated.remainingPct > 10) {
+          soldPct = 15;
+          updated.remainingPct = 10;
+          tpMsg = `🎯 *TAKE PROFIT 3 — +500%*\n• Sold: 15% of position\n• Remaining: 10%\n• Next TP: +900%`;
+        } else if (pnlPct >= 900 && updated.remainingPct > 0) {
+          soldPct = 10;
+          updated.remainingPct = 0;
+          tpMsg = `🎯 *TAKE PROFIT 4 — +900%*\n• Sold: final 10% of position\n• Position fully closed`;
+        }
+
+        if (tpMsg) {
+          const pnlSol = (pos.sizeSol * (soldPct / 100) * pnlPct) / 100;
+          const fullMsg = [
+            tpMsg, ``,
+            `*Token:* $${escapeText(pos.ticker)}`,
+            `*Entry:* $${pos.entryPrice.toFixed(8)}`,
+            `*Current:* $${currentPrice.toFixed(8)}`,
+            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
+            `*Profit taken:* +${pnlSol.toFixed(4)} SOL`,
+          ].join('\n');
+          await bot.telegram.sendMessage(CHAT_ID, fullMsg, { parse_mode: 'Markdown' });
+
+          // If fully exited
+          if (updated.remainingPct === 0) {
+            openPositions.delete(address);
+            console.log(`✅ Position fully closed: ${pos.ticker} at +${pnlPct.toFixed(1)}%`);
+            openPositions.set(address, updated);
+            return;
+          }
+        }
+
+        // ── STOP LOSS CHECK — uses dynamic level ──
+        const stopLossPrice = pos.entryPrice * (1 + updated.stopLossPct / 100);
+        const stopLossHit = currentPrice <= stopLossPrice;
+
+        if (stopLossHit && updated.remainingPct > 0) {
+          const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
+          const stopLabel =
+            updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
+            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
+            '🛑 STOP LOSS — -20% Hit';
+
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Address:* \`${address}\``, ``,
             `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
             `*Exit Price:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* 🔴 ${pnlPct.toFixed(2)}%`,
-            `*PnL in SOL:* ${pnlSol.toFixed(4)} SOL`,
+            `*PnL:* ${pnlPct >= 0 ? '🟢' : '🔴'} ${pnlPct.toFixed(2)}%`,
+            `*PnL in SOL:* ${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)} SOL`,
             `*Size:* ${pos.sizeSol} SOL`,
             `*Held:* ${holdingMins} minutes`, ``,
-            `🛑 STOP LOSS — \-20% Hit`,
+            stopLabel,
           ].join('\n');
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          await closeTrade(address, currentPrice, 'STOP_LOSS', pos.sizeSol);
           openPositions.delete(address);
-          console.log(`✅ Stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           return;
         }
 
@@ -436,114 +394,6 @@ async function monitorPositions() {
       console.log(`❌ Monitor error ${address}: ${err.message}`);
     }
   }));
-
-  // ── WATCHLIST MONITOR: check for +5% confirmation or -5% skip ──
-  for (const [address, entry] of watchlist.entries()) {
-    try {
-      const { price: currentPrice } = await getLivePrice(address);
-      if (!currentPrice || !entry.watchPrice) continue;
-
-      const changePct = ((currentPrice - entry.watchPrice) / entry.watchPrice) * 100;
-      const ageMinutes = (Date.now() - entry.addedAt) / 60000;
-
-      console.log(`👀 Watchlist ${entry.ticker}: ${changePct.toFixed(1)}% from watch price | age ${ageMinutes.toFixed(1)}m`);
-
-      // +5% confirmed — fire the alert
-      if (changePct >= 5) {
-        const sourceLabel: Record<string, string> = {
-          'pumpfun-new': '🆕 Pump\.fun \(Just Launched\)',
-          'dex-new': '⚡ New DEX Pair',
-          'pumpswap': '🔄 PumpSwap',
-          'profiles': '📈 Trending',
-          'reversal': '🔄 Reversal \(Retraced & Building\)'
-        };
-        const isReversal = entry.source === 'reversal';
-        const reversalLine = isReversal
-          ? [``, `📉 *Reversal Signal:* 24h: ${entry.h24.toFixed(1)}% | 1h: +${entry.h1.toFixed(1)}% recovering`]
-          : [];
-
-        const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
-          `*Token:* $${escapeText(entry.ticker)}`,
-          `*Address:* \`${address}\``,
-          `*Market Cap:* 💰 $${entry.mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-          `*Liquidity:* $${entry.liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-          `*Source:* ${sourceLabel[entry.source] || '📈 Trending'}`,
-          ...reversalLine, ``,
-          `✅ *Watchlist Confirmed:* +${changePct.toFixed(1)}% momentum confirmed`,
-          ``,
-          `📊 *AI Intelligence Matrix:*`,
-          `• Alpha Score: 🟢 ${entry.alphaScore}/100`,
-          `• Rug Probability: 🛡 ${(entry.rugProb * 100).toFixed(0)}%`,
-          `• Dynamic Mode: ${getDynamicMode(entry.alphaScore)}`, ``,
-          `📱 [Monitor Chart Live](https://dexscreener.com/solana/${address})`,
-        ].join('\n');
-
-        await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-        console.log(`✅ Watchlist confirmed: ${entry.ticker} +${changePct.toFixed(1)}%`);
-
-        // Execute buy if risk allows
-        if (entry.risk?.allow) {
-          try {
-            const tx = await executor.buildJupiterSwapTransaction(address, entry.risk.sizeSol, 'BUY');
-            tx.sign([executor.getWalletKeypair()]);
-            const result = await executor.dispatchMevProtectedBundle(tx);
-            if (result.success && currentPrice > 0) {
-              openPositions.set(address, {
-                ticker: entry.ticker, address,
-                entryPrice: currentPrice,
-                peakPrice: currentPrice,
-                sizeSol: entry.risk.sizeSol,
-                entryTime: Date.now(),
-                stopLossLevel: 'initial',
-                stopLossPct: -20,
-                remainingPct: 100,
-              });
-              console.log(`📌 Watchlist position opened: ${entry.ticker} @ $${currentPrice}`);
-            }
-          } catch (execErr: any) {
-            console.log(`⚠️ Watchlist buy failed: ${execErr.message}`);
-          }
-        }
-
-        // Record in history
-        if (!alertHistory.has(address)) {
-          alertHistory.set(address, {
-            ticker: entry.ticker, address,
-            alertTime: Date.now(),
-            alertMcap: entry.mcap,
-            alertPrice: currentPrice,
-            peakMcap: entry.mcap,
-            peakPrice: currentPrice,
-            peakTime: Date.now(),
-            currentMcap: entry.mcap,
-            currentPrice,
-            lastUpdated: Date.now()
-          });
-        }
-
-        watchlist.delete(address);
-        seenTokens.add(address);
-      }
-
-      // -5% dropped — skip, do NOT add to seenTokens so it can recover
-      else if (changePct <= -5) {
-        console.log(`⏭ Watchlist ${entry.ticker} dropped ${changePct.toFixed(1)}%, removed — stays eligible`);
-        watchlist.delete(address);
-        // intentionally NOT adding to seenTokens
-      }
-
-      // Timeout after 10 minutes — remove without alerting
-      else if (ageMinutes >= 10) {
-        console.log(`⏱ Watchlist ${entry.ticker} timed out after 10 mins, removing`);
-        watchlist.delete(address);
-        seenTokens.add(address);
-      }
-
-    } catch (err: any) {
-      console.log(`❌ Watchlist monitor error ${entry.ticker}: ${err.message}`);
-    }
-  }
 
   await saveHistory();
 }
@@ -596,7 +446,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 40000
+          parseFloat(p.fdv || p.marketCap || '0') <= 30000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -644,7 +494,7 @@ async function scan() {
         const mcapMin = isNew ? 500 : 1000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 40000) continue;
+        if (mcap < mcapMin || mcap > 30000) continue;
 
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
@@ -682,23 +532,6 @@ async function scan() {
           continue;
         }
 
-        // ── WATCHLIST CONFIRMATION: tokens above $10k mcap wait for +5% move ──
-        if (mcap >= 10000 && !watchlist.has(address)) {
-          watchlist.set(address, {
-            ticker, address, mcap, liquidity, alphaScore, rugProb,
-            watchPrice: currentPrice,
-            addedAt: Date.now(),
-            source: p.source,
-            h24: pair ? parseFloat(pair.priceChange?.h24 || '0') : 0,
-            h1: pair ? parseFloat(pair.priceChange?.h1 || '0') : 0,
-            pattern, risk,
-          });
-          console.log(`👀 Watchlist: ${ticker} @ $${currentPrice} (mcap $${mcap.toFixed(0)}) — waiting for +5%`);
-          seenTokens.add(p.tokenAddress);
-          continue;
-        }
-
-        // ── Under $10k mcap — buy immediately, no confirmation ──
         const h24 = pair ? parseFloat(pair.priceChange?.h24 || '0') : 0;
         const h1 = pair ? parseFloat(pair.priceChange?.h1 || '0') : 0;
 
@@ -708,25 +541,8 @@ async function scan() {
 
         if (risk.allow) {
           try {
-            // ── Use direct pump.fun bonding curve for pre-graduation tokens ──
-            // ── Fall back to Jupiter for graduated/Raydium tokens ──
-            let tx;
-            const isPumpPreGrad = address.endsWith('pump');
-            if (isPumpPreGrad) {
-              try {
-                tx = await executor.buildPumpFunSwapTransaction(address, risk.sizeSol, 'BUY');
-                console.log(`⚡ Using direct pump.fun bonding curve for ${ticker}`);
-              } catch (pumpErr: any) {
-                // If bonding curve call fails (e.g. already graduated), fall back to Jupiter
-                console.log(`⚠️ Pump.fun direct failed (${pumpErr.message}), falling back to Jupiter`);
-                tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-                tx.sign([executor.getWalletKeypair()]);
-              }
-            } else {
-              tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
-              tx.sign([executor.getWalletKeypair()]);
-            }
-
+            const tx = await executor.buildJupiterSwapTransaction(address, risk.sizeSol, 'BUY');
+            tx.sign([executor.getWalletKeypair()]);
             const result = await executor.dispatchMevProtectedBundle(tx);
             if (result.success) {
               const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
@@ -740,7 +556,7 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
-                  // ── Start with initial stop loss at -20% ──
+                  // ── Start with initial stop loss at -30% ──
                   stopLossLevel: 'initial',
                   stopLossPct: -20,
                   remainingPct: 100,
@@ -776,20 +592,6 @@ async function scan() {
             lastUpdated: Date.now()
           });
           await saveHistory();
-
-          // ── Log to trades_log ──
-          await logTradeAlert({
-            address, ticker, source: p.source,
-            alertPrice: currentPrice, alertMcap: mcap,
-            entryPrice: executedPrice, entrySizeSol: executedSizeSol,
-            alphaScore, rugProbability: rugProb,
-            uniqueBuyers: pattern.uniqueBuyers,
-            buyerVelocity: pattern.buyerVelocity,
-            topHolderPct: pattern.topHolderConcentration,
-            isBundledLaunch: pattern.isBundledLaunch,
-            washTrading: pattern.washTradingDetected,
-            smartMoney: pattern.smartCohortPresence,
-          });
         }
 
         const walletShort = `${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}`;
@@ -949,21 +751,18 @@ function getPeriodDateString(period: string): string {
 
 async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
   const now = Date.now();
-
-  // ── FIX: daily uses calendar day from midnight UTC, not rolling 24h ──
   let cutoff: number;
-  if (period === 'daily') {
-    const todayUTC = new Date();
-    todayUTC.setUTCHours(0, 0, 0, 0);
-    cutoff = todayUTC.getTime();
-  } else if (period === 'weekly') {
-    cutoff = now - 7 * 24 * 60 * 60 * 1000;
-  } else if (period === 'monthly') {
-    cutoff = now - 30 * 24 * 60 * 60 * 1000;
-  } else {
-    cutoff = 0; // lifetime
-  }
-
+if (period === 'daily') {
+  const todayUTC = new Date();
+  todayUTC.setUTCHours(0, 0, 0, 0);
+  cutoff = todayUTC.getTime();
+} else if (period === 'weekly') {
+  cutoff = now - 7 * 24 * 60 * 60 * 1000;
+} else if (period === 'monthly') {
+  cutoff = now - 30 * 24 * 60 * 60 * 1000;
+} else {
+  cutoff = 0;
+}
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
@@ -1164,133 +963,6 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard(result.buttons)
   });
-});
-
-// ── /report — sends CSV of all trades for selected period to Telegram ──
-bot.command('report', async (ctx) => {
-  await ctx.reply(
-    '📊 *Select report period:*',
-    {
-      parse_mode: 'Markdown',
-      ...Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Daily', 'report_daily')],
-        [Markup.button.callback('📆 Weekly', 'report_weekly')],
-        [Markup.button.callback('🗓 Monthly', 'report_monthly')],
-        [Markup.button.callback('🏆 Lifetime', 'report_lifetime')],
-      ])
-    }
-  );
-});
-
-bot.action(/^report_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery('Generating report...');
-  const period = ctx.match[1];
-
-  let cutoff: number;
-  const now = Date.now();
-  if (period === 'daily') {
-    const todayUTC = new Date();
-    todayUTC.setUTCHours(0, 0, 0, 0);
-    cutoff = todayUTC.getTime();
-  } else if (period === 'weekly') {
-    cutoff = now - 7 * 24 * 60 * 60 * 1000;
-  } else if (period === 'monthly') {
-    cutoff = now - 30 * 24 * 60 * 60 * 1000;
-  } else {
-    cutoff = 0;
-  }
-
-  try {
-    const result = await db.query(`
-      SELECT
-        ticker, address, source,
-        to_timestamp(alert_time / 1000) AT TIME ZONE 'UTC' AS alert_time,
-        alert_price, alert_mcap,
-        entry_price, entry_size_sol,
-        peak_price, peak_mcap,
-        to_timestamp(peak_time / 1000) AT TIME ZONE 'UTC' AS peak_time,
-        peak_gain_pct,
-        exit_price,
-        to_timestamp(exit_time / 1000) AT TIME ZONE 'UTC' AS exit_time,
-        exit_type, pnl_pct, pnl_sol, held_minutes,
-        alpha_score, rug_probability,
-        unique_buyers, buyer_velocity, top_holder_pct,
-        is_bundled_launch, wash_trading, smart_money, status
-      FROM trades_log
-      WHERE alert_time >= $1
-      ORDER BY alert_time DESC
-    `, [cutoff]);
-
-    if (result.rows.length === 0) {
-      await ctx.reply('📭 No trades found for this period.');
-      return;
-    }
-
-    // ── Build CSV ──
-    const headers = [
-      'Ticker','Address','Source','Alert Time (UTC)','Alert Price','Alert MCAP',
-      'Entry Price','Entry Size (SOL)','Peak Price','Peak MCAP','Peak Time (UTC)',
-      'Peak Gain %','Exit Price','Exit Time (UTC)','Exit Type',
-      'PnL %','PnL SOL','Held (mins)',
-      'Alpha Score','Rug Prob','Unique Buyers','Buyer Velocity','Top Holder %',
-      'Bundled Launch','Wash Trading','Smart Money','Status'
-    ];
-
-    const csvRows = result.rows.map(r => [
-      r.ticker, r.address, r.source,
-      r.alert_time ? new Date(r.alert_time).toISOString() : '',
-      r.alert_price ?? '', r.alert_mcap ?? '',
-      r.entry_price ?? '', r.entry_size_sol ?? '',
-      r.peak_price ?? '', r.peak_mcap ?? '',
-      r.peak_time ? new Date(r.peak_time).toISOString() : '',
-      r.peak_gain_pct ?? '',
-      r.exit_price ?? '',
-      r.exit_time ? new Date(r.exit_time).toISOString() : '',
-      r.exit_type ?? '', r.pnl_pct ?? '', r.pnl_sol ?? '', r.held_minutes ?? '',
-      r.alpha_score ?? '', r.rug_probability ?? '',
-      r.unique_buyers ?? '', r.buyer_velocity ?? '', r.top_holder_pct ?? '',
-      r.is_bundled_launch, r.wash_trading, r.smart_money, r.status
-    ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
-
-    const csv = [headers.join(','), ...csvRows].join('\n');
-    const csvBuffer = Buffer.from(csv, 'utf-8');
-
-    // ── Winrate summary ──
-    const closed = result.rows.filter(r => r.status === 'CLOSED' && r.pnl_pct != null);
-    const wins = closed.filter(r => parseFloat(r.pnl_pct) > 0);
-    const losses = closed.filter(r => parseFloat(r.pnl_pct) <= 0);
-    const totalPnlPct = closed.reduce((s, r) => s + parseFloat(r.pnl_pct || '0'), 0);
-    const totalPnlSol = closed.reduce((s, r) => s + parseFloat(r.pnl_sol || '0'), 0);
-    const winRate = closed.length > 0 ? ((wins.length / closed.length) * 100).toFixed(1) : '0.0';
-    const periodLabel: Record<string, string> = {
-      daily: 'Daily', weekly: 'Weekly', monthly: 'Monthly', lifetime: 'Lifetime'
-    };
-
-    const summary = [
-      `📊 *${periodLabel[period]} Trade Report*`, ``,
-      `• *Total Alerts:* ${result.rows.length}`,
-      `• *Closed Trades:* ${closed.length}`,
-      `• *Wins:* ${wins.length} | *Losses:* ${losses.length}`,
-      `• *Win Rate:* ${parseFloat(winRate) >= 50 ? '🟢' : '🔴'} ${winRate}%`,
-      `• *Total PnL %:* ${totalPnlPct >= 0 ? '🟢 +' : '🔴 '}${totalPnlPct.toFixed(2)}%`,
-      `• *Total PnL SOL:* ${totalPnlSol >= 0 ? '🟢 +' : '🔴 '}${totalPnlSol.toFixed(4)} SOL`,
-      ``,
-      `📎 Full CSV attached below`,
-    ].join('\n');
-
-    await ctx.reply(summary, { parse_mode: 'Markdown' });
-
-    // ── Send CSV as document ──
-    const filename = `trades_${period}_${new Date().toISOString().slice(0, 10)}.csv`;
-    await bot.telegram.sendDocument(CHAT_ID, {
-      source: csvBuffer,
-      filename
-    }, { caption: `${periodLabel[period]} trades export — ${result.rows.length} records` });
-
-  } catch (e: any) {
-    console.log(`❌ Report error: ${e.message}`);
-    await ctx.reply('❌ Report generation failed. Check logs.');
-  }
 });
 
 // ✅ Heartbeat — console only, NOT Telegram
