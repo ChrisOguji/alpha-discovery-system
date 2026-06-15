@@ -150,6 +150,7 @@ function getDynamicMode(score: number): string {
   return '⚡ ORGANIC';
 }
 
+// AFTER
 function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): number {
   let score = 0;
   const ratio = liquidity / mcap;
@@ -158,9 +159,18 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
   if (mcap >= 1000 && mcap <= 40000) score += 25;
-  if (liquidity >= 25000) score += 20;
-  else if (liquidity >= 10000) score += 12;
-  else if (liquidity >= 5000) score += 6;
+
+  // ── Liquidity scoring: ratio bonus for $10k–$17k range, raw otherwise ──
+  if (mcap >= 10000 && mcap <= 17000) {
+    if (ratio >= 0.30) score += 20;
+    else if (ratio >= 0.20) score += 14;
+    else if (ratio >= 0.10) score += 7;
+  } else {
+    if (liquidity >= 25000) score += 20;
+    else if (liquidity >= 10000) score += 12;
+    else if (liquidity >= 5000) score += 6;
+  }
+
   if (rugProb <= 0.10) score += 15;
   else if (rugProb <= 0.20) score += 8;
   else if (rugProb >= 0.30) score -= 10;
@@ -183,10 +193,12 @@ function isReversalCandidate(pair: any): boolean {
   const volH24 = parseFloat(pair.volume?.h24 || '0');
   const volH6 = parseFloat(pair.volume?.h6 || '0');
   const dumpedHard = h24 <= -40;
-  const recoveringH1 = h1 >= 5;
-  const recoveringH6 = h6 >= 10;
-  const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
-  return dumpedHard && (recoveringH1 || recoveringH6) && volumeReturning;
+  // AFTER
+const recoveringH1 = h1 > 0;
+const stillDownH6 = h6 < 0;
+const volumeReturning = volH6 > 0 && volH24 > 0 && (volH6 / volH24) > 0.3;
+const dumpedHard = h24 <= -40;
+return dumpedHard && recoveringH1 && stillDownH6 && volumeReturning;
 }
 
 function startPumpPortalStream() {
@@ -446,7 +458,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 1000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 30000
+          parseFloat(p.fdv || p.marketCap || '0') <= 26000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -494,12 +506,12 @@ async function scan() {
         const mcapMin = isNew ? 500 : 1000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 30000) continue;
+        if (mcap < mcapMin || mcap > 26000) continue;
 
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 7) {
+          if (ageMinutes < 50) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
