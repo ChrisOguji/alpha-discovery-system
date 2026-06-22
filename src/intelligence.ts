@@ -194,32 +194,113 @@ export class OnChainPatternRecognition {
 
   // ── Real pump.fun detection ──
   private async isPumpFunToken(mint: string): Promise<boolean> {
-  try {
-    // ✅ All pump.fun token addresses end in 'pump'
-    if (mint.endsWith('pump')) return true;
+    try {
+      // ✅ All pump.fun token addresses end in 'pump'
+      if (mint.endsWith('pump')) return true;
 
-    // Fallback: check Helius transactions for pump.fun program
-    const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
-    const res = await axios.get(`${HELIUS_API}/addresses/${mint}/transactions`, {
-      params: { 'api-key': HELIUS_API_KEY, limit: 5 },
-      timeout: 5000
-    });
+      // Fallback: check Helius transactions for pump.fun program
+      const PUMP_FUN_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+      const res = await axios.get(`${HELIUS_API}/addresses/${mint}/transactions`, {
+        params: { 'api-key': HELIUS_API_KEY, limit: 5 },
+        timeout: 5000
+      });
 
-    const txs = res.data || [];
-    return txs.some((tx: any) =>
-      (tx.accountData || []).some((a: any) => a.account === PUMP_FUN_PROGRAM) ||
-      tx.source?.toLowerCase() === 'pump_fun' ||
-      tx.description?.toLowerCase().includes('pump.fun')
-    );
-  } catch {
-    // If Helius fails, fall back to address check
-    return mint.endsWith('pump');
+      const txs = res.data || [];
+      return txs.some((tx: any) =>
+        (tx.accountData || []).some((a: any) => a.account === PUMP_FUN_PROGRAM) ||
+        tx.source?.toLowerCase() === 'pump_fun' ||
+        tx.description?.toLowerCase().includes('pump.fun')
+      );
+    } catch {
+      // If Helius fails, fall back to address check
+      return mint.endsWith('pump');
+    }
   }
-}
+
+  // ── Deep reversal on-chain analysis via Helius ──
+  public async analyzeReversalOnChain(mint: string): Promise<{
+    passed: boolean;
+    reason: string;
+    accumulationScore: number;
+  }> {
+    try {
+      const res = await axios.get(`${HELIUS_API}/addresses/${mint}/transactions`, {
+        params: { 'api-key': HELIUS_API_KEY, limit: 50 },
+        timeout: 6000
+      });
+
+      const txs = res.data || [];
+      const now = Date.now() / 1000;
+      const recentTxs = txs.filter((tx: any) => now - tx.timestamp < 3600);
+
+      const dipBuyers = new Set<string>();
+      const dipSellers = new Set<string>();
+
+      for (const tx of recentTxs) {
+        if (tx.type !== 'SWAP') continue;
+        const wallet = tx.feePayer;
+        if (!wallet) continue;
+        for (const t of (tx.tokenTransfers || [])) {
+          if (t.mint !== mint) continue;
+          if (t.toUserAccount === wallet) dipBuyers.add(wallet);
+          if (t.fromUserAccount === wallet) dipSellers.add(wallet);
+        }
+      }
+
+      const buySellerRatio = dipSellers.size === 0 ? dipBuyers.size : dipBuyers.size / dipSellers.size;
+
+      const highValueDipBuyers = new Set<string>();
+      for (const tx of recentTxs) {
+        const wallet = tx.feePayer;
+        if (!wallet) continue;
+        const solSpent = (tx.nativeTransfers || [])
+          .filter((t: any) => t.fromUserAccount === wallet)
+          .reduce((sum: number, t: any) => sum + t.amount, 0);
+        if (solSpent >= 300000000) highValueDipBuyers.add(wallet);
+      }
+
+      const firstTx = txs[txs.length - 1];
+      const devWallet = firstTx?.feePayer;
+      let devSelling = false;
+      if (devWallet) {
+        for (const tx of recentTxs) {
+          if (tx.feePayer !== devWallet) continue;
+          for (const t of (tx.tokenTransfers || [])) {
+            if (t.mint === mint && t.fromUserAccount === devWallet) {
+              devSelling = true;
+              break;
+            }
+          }
+        }
+      }
+
+      const netNewHolders = dipBuyers.size - dipSellers.size;
+
+      let accumulationScore = 0;
+      if (dipBuyers.size >= 5) accumulationScore += 25;
+      else if (dipBuyers.size >= 3) accumulationScore += 15;
+      if (buySellerRatio >= 2) accumulationScore += 25;
+      else if (buySellerRatio >= 1.5) accumulationScore += 15;
+      if (highValueDipBuyers.size >= 2) accumulationScore += 25;
+      else if (highValueDipBuyers.size >= 1) accumulationScore += 15;
+      if (netNewHolders >= 3) accumulationScore += 15;
+      if (!devSelling) accumulationScore += 10;
+
+      if (devSelling) return { passed: false, reason: 'DEV_DUMPING_DURING_DIP', accumulationScore };
+      if (dipBuyers.size < 3) return { passed: false, reason: 'INSUFFICIENT_DIP_BUYERS', accumulationScore };
+      if (buySellerRatio < 1.5) return { passed: false, reason: 'SELL_PRESSURE_STILL_HIGH', accumulationScore };
+      if (accumulationScore < 50) return { passed: false, reason: `WEAK_ACCUMULATION_${accumulationScore}`, accumulationScore };
+
+      return { passed: true, reason: 'STRONG_ACCUMULATION', accumulationScore };
+
+    } catch {
+      return { passed: true, reason: 'HELIUS_SKIP', accumulationScore: 0 };
+    }
+  }
 
   // ── MAIN ANALYSIS ──
   // ── FIX 3: Accept isNew flag to skip LOW_BUYER_VELOCITY gate for brand new tokens ──
-  public async analyzePattern(signal: TokenSignal, creatorAddress?: string, isNew = false): Promise<PatternMetrics> {
+  public async analyzePattern(signal: TokenSignal, creatorAddress?: string, isNew = false, isReversal = false): Promise<PatternMetrics> {
     try {
       console.log(`🧠 Analysing ${signal.ticker}...`);
 
@@ -273,7 +354,14 @@ export class OnChainPatternRecognition {
 
       // ── Rug probability hard reject — number 1 ──
       if (signal.rugProbability > 0.15) return { ...base, reason: `RUG_PROB_TOO_HIGH_${(signal.rugProbability * 100).toFixed(0)}PCT` };
-      
+
+      // ── Reversal deep check — only runs for reversal-sourced tokens ──
+      if (isReversal) {
+        const reversalCheck = await this.analyzeReversalOnChain(signal.tokenAddress);
+        if (!reversalCheck.passed) return { ...base, reason: reversalCheck.reason };
+        console.log(`🔄 Reversal accumulation score: ${reversalCheck.accumulationScore}/100`);
+      }
+
       console.log(`✅ ${signal.ticker} PASSED | Buyers: ${buyerVelocity.uniqueBuyers} | Top5: ${concentrationPct}% | Smart: ${smartMoney}`);
       return { ...base, passedPatterns: true };
 
