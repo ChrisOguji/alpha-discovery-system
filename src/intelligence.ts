@@ -345,7 +345,7 @@ export class OnChainPatternRecognition {
 
       // ── Gates ──
       if (!isPump) return { ...base, reason: 'NOT_PUMPFUN_TOKEN' };
-      if (topConcentration > 0.40) return { ...base, reason: 'TOP_HOLDERS_EXCEED_40PCT' };
+      if (topConcentration > 0.50) return { ...base, reason: 'TOP_HOLDERS_EXCEED_50PCT' };
       if (bundled) return { ...base, reason: 'BUNDLED_LAUNCH_DETECTED' };
       if (washTrading) return { ...base, reason: 'WASH_TRADING_DETECTED' };
       if (deployerHistory.rugCount >= 2) return { ...base, reason: `DEPLOYER_${deployerHistory.rugCount}_RUGS` };
