@@ -303,13 +303,13 @@ async function monitorPositions() {
         const holdingMins = Math.floor((now - pos.entryTime) / 60000);
 
         // ── DYNAMIC TRAILING STOP LOSS ──
-        // Level 1: profit hits +15% → move stop loss to -10% below entry
-        if (pnlPct >= 15 && updated.stopLossLevel === 'initial') {
+        // Level 1: profit hits +30% → move stop loss to -20% below entry
+        if (pnlPct >= 30 && updated.stopLossLevel === 'initial') {
           updated.stopLossLevel = 'breakeven';
-          updated.stopLossPct = -10;
-          console.log(`🔒 ${pos.ticker} stop loss moved to -10% below entry (profit: +${pnlPct.toFixed(1)}%)`);
+          updated.stopLossPct = -20;
+          console.log(`🔒 ${pos.ticker} stop loss moved to -20% below entry (profit: +${pnlPct.toFixed(1)}%)`);
           await bot.telegram.sendMessage(CHAT_ID,
-            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -10% below entry\n*Protected from:* full loss`,
+            `🔒 *STOP LOSS UPGRADED*\n\n*Token:* $${escapeText(pos.ticker)}\n*Profit hit:* +${pnlPct.toFixed(1)}%\n*Stop loss moved to:* -20% below entry\n*Protected from:* full loss`,
             { parse_mode: 'Markdown' }
           );
         }
@@ -325,48 +325,22 @@ async function monitorPositions() {
           );
         }
 
-        // ── STAGED TAKE PROFIT ──
-        // 60% at +100%, 15% at +250%, 15% at +500%, 10% at +900%
-        let tpMsg = '';
-        let soldPct = 0;
-
-        if (pnlPct >= 100 && updated.remainingPct > 40) {
-          soldPct = 60;
-          updated.remainingPct = 40;
-          tpMsg = `🎯 *TAKE PROFIT 1 — +100%*\n• Sold: 60% of position\n• Remaining: 40%\n• Next TP: +250%`;
-        } else if (pnlPct >= 250 && updated.remainingPct > 25) {
-          soldPct = 15;
-          updated.remainingPct = 25;
-          tpMsg = `🎯 *TAKE PROFIT 2 — +250%*\n• Sold: 15% of position\n• Remaining: 25%\n• Next TP: +500%`;
-        } else if (pnlPct >= 500 && updated.remainingPct > 10) {
-          soldPct = 15;
-          updated.remainingPct = 10;
-          tpMsg = `🎯 *TAKE PROFIT 3 — +500%*\n• Sold: 15% of position\n• Remaining: 10%\n• Next TP: +900%`;
-        } else if (pnlPct >= 900 && updated.remainingPct > 0) {
-          soldPct = 10;
-          updated.remainingPct = 0;
-          tpMsg = `🎯 *TAKE PROFIT 4 — +900%*\n• Sold: final 10% of position\n• Position fully closed`;
-        }
-
-        if (tpMsg) {
-          const pnlSol = (pos.sizeSol * (soldPct / 100) * pnlPct) / 100;
-          const fullMsg = [
-            tpMsg, ``,
+        // ── TAKE PROFIT: sell everything at +70% ──
+        if (pnlPct >= 70 && updated.remainingPct > 0) {
+          const pnlSol = pos.sizeSol * (pnlPct / 100);
+          const msg = [
+            `🎯 *TAKE PROFIT — +70% HIT*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Entry:* $${pos.entryPrice.toFixed(8)}`,
-            `*Current:* $${currentPrice.toFixed(8)}`,
+            `*Exit:* $${currentPrice.toFixed(8)}`,
             `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
-            `*Profit taken:* +${pnlSol.toFixed(4)} SOL`,
+            `*Profit:* +${pnlSol.toFixed(4)} SOL`,
+            `*Position fully closed.*`,
           ].join('\n');
-          await bot.telegram.sendMessage(CHAT_ID, fullMsg, { parse_mode: 'Markdown' });
-
-          // If fully exited
-          if (updated.remainingPct === 0) {
-            openPositions.delete(address);
-            console.log(`✅ Position fully closed: ${pos.ticker} at +${pnlPct.toFixed(1)}%`);
-            openPositions.set(address, updated);
-            return;
-          }
+          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+          openPositions.delete(address);
+          console.log(`✅ Full exit at +70%: ${pos.ticker}`);
+          return;
         }
 
         // ── STOP LOSS CHECK — uses dynamic level ──
@@ -377,8 +351,8 @@ async function monitorPositions() {
           const pnlSol = (pos.sizeSol * (updated.remainingPct / 100) * pnlPct) / 100;
           const stopLabel =
             updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
-            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -10% Below Entry' :
-            '🛑 STOP LOSS — -20% Hit';
+            updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -20% Below Entry' :
+            '🛑 STOP LOSS — -50% Hit';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -566,9 +540,9 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
-                  // ── Start with initial stop loss at -30% ──
+                  // ── Start with initial stop loss at -50% ──
                   stopLossLevel: 'initial',
-                  stopLossPct: -20,
+                  stopLossPct: -50,
                   remainingPct: 100,
                 });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
@@ -973,6 +947,36 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard(result.buttons)
   });
+});
+
+// ✅ /report — exports full trade history as a downloadable CSV
+bot.command('report', async (ctx) => {
+  if (alertHistory.size === 0) return ctx.reply('📭 No trade history to export.');
+
+  const headers = 'Ticker,Address,Alert Time,Alert MCAP,Alert Price,Peak MCAP,Peak Price,Peak Gain %,Current Price,Current PnL %\n';
+
+  const rows = Array.from(alertHistory.values())
+    .sort((a, b) => b.alertTime - a.alertTime)
+    .map(rec => {
+      const peakGain = rec.alertPrice > 0
+        ? (((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(2)
+        : '0';
+      const currentPnl = rec.alertPrice > 0
+        ? (((rec.currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(2)
+        : '0';
+      const alertDate = new Date(rec.alertTime).toUTCString();
+      return `${rec.ticker},${rec.address},"${alertDate}",${rec.alertMcap.toFixed(0)},${rec.alertPrice.toFixed(8)},${rec.peakMcap.toFixed(0)},${rec.peakPrice.toFixed(8)},${peakGain}%,${rec.currentPrice.toFixed(8)},${currentPnl}%`;
+    })
+    .join('\n');
+
+  const csv = headers + rows;
+  const buffer = Buffer.from(csv, 'utf-8');
+
+  await ctx.replyWithDocument({
+    source: buffer,
+    filename: `alpha-report-${new Date().toISOString().slice(0, 10)}.csv`
+  });
+  console.log(`📤 Report exported: ${alertHistory.size} trades`);
 });
 
 // ✅ Heartbeat — console only, NOT Telegram
