@@ -60,6 +60,10 @@ interface AlertRecord {
   currentMcap: number;
   currentPrice: number;
   lastUpdated: number;
+  exitReason?: 'TP' | 'SL' | 'OPEN';
+  exitPrice?: number;
+  exitMcap?: number;
+  exitTime?: number;
 }
 let alertHistory = new Map<string, AlertRecord>();
 
@@ -325,7 +329,7 @@ async function monitorPositions() {
           );
         }
 
-        // ── TAKE PROFIT: sell everything at +70% ──
+        // ── TAKE PROFIT: sell everything at +50% ──
         if (pnlPct >= 50 && updated.remainingPct > 0) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const msg = [
@@ -340,6 +344,17 @@ async function monitorPositions() {
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
           console.log(`✅ Full exit at +50%: ${pos.ticker}`);
+          if (alertHistory.has(address)) {
+            const rec = alertHistory.get(address)!;
+            alertHistory.set(address, {
+              ...rec,
+              exitReason: 'TP',
+              exitPrice: currentPrice,
+              exitMcap: currentMcap,
+              exitTime: Date.now()
+            });
+            await saveHistory();
+          }
           return;
         }
 
@@ -352,7 +367,7 @@ async function monitorPositions() {
           const stopLabel =
             updated.stopLossLevel === 'trailing' ? '🔐 TRAILING STOP — +2% Above Entry' :
             updated.stopLossLevel === 'breakeven' ? '🔒 DYNAMIC STOP — -20% Below Entry' :
-            '🛑 STOP LOSS — -50% Hit';
+            '🛑 STOP LOSS — -35% Hit';
 
           const msg = [
             `💰 *POSITION CLOSED*`, ``,
@@ -369,6 +384,17 @@ async function monitorPositions() {
           await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           openPositions.delete(address);
           console.log(`✅ Closed via stop loss: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          if (alertHistory.has(address)) {
+            const rec = alertHistory.get(address)!;
+            alertHistory.set(address, {
+              ...rec,
+              exitReason: 'SL',
+              exitPrice: currentPrice,
+              exitMcap: currentMcap,
+              exitTime: Date.now()
+            });
+            await saveHistory();
+          }
           return;
         }
 
@@ -540,9 +566,9 @@ async function scan() {
                   peakPrice: executedPrice,
                   sizeSol: executedSizeSol,
                   entryTime: Date.now(),
-                  // ── Start with initial stop loss at -50% ──
+                  // ── Start with initial stop loss at -35% ──
                   stopLossLevel: 'initial',
-                  stopLossPct: -50,
+                  stopLossPct: -35,
                   remainingPct: 100,
                 });
                 console.log(`📌 Position opened: ${ticker} @ $${executedPrice}`);
@@ -953,7 +979,7 @@ bot.action(/^refresh_pnl_(.+)$/, async (ctx) => {
 bot.command('report', async (ctx) => {
   if (alertHistory.size === 0) return ctx.reply('📭 No trade history to export.');
 
-  const headers = 'Ticker,Address,Alert Time,Alert MCAP,Alert Price,Peak MCAP,Peak Price,Peak Gain %,Current Price,Current PnL %\n';
+  const headers = 'Ticker,Address,Alert Time,Alert MCAP,Alert Price,Peak MCAP,Peak Price,Peak Gain %,Current Price,Current PnL %,Exit Reason,Exit Price,Exit MCAP,Exit Time\n';
 
   const rows = Array.from(alertHistory.values())
     .sort((a, b) => b.alertTime - a.alertTime)
@@ -965,7 +991,11 @@ bot.command('report', async (ctx) => {
         ? (((rec.currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(2)
         : '0';
       const alertDate = new Date(rec.alertTime).toUTCString();
-      return `${rec.ticker},${rec.address},"${alertDate}",${rec.alertMcap.toFixed(0)},${rec.alertPrice.toFixed(8)},${rec.peakMcap.toFixed(0)},${rec.peakPrice.toFixed(8)},${peakGain}%,${rec.currentPrice.toFixed(8)},${currentPnl}%`;
+      const exitReason = rec.exitReason || 'OPEN';
+      const exitPrice = rec.exitPrice ? rec.exitPrice.toFixed(8) : '-';
+      const exitMcap = rec.exitMcap ? rec.exitMcap.toFixed(0) : '-';
+      const exitTime = rec.exitTime ? new Date(rec.exitTime).toUTCString() : '-';
+      return `${rec.ticker},${rec.address},"${alertDate}",${rec.alertMcap.toFixed(0)},${rec.alertPrice.toFixed(8)},${rec.peakMcap.toFixed(0)},${rec.peakPrice.toFixed(8)},${peakGain}%,${rec.currentPrice.toFixed(8)},${currentPnl}%,${exitReason},${exitPrice},${exitMcap},"${exitTime}"`;
     })
     .join('\n');
 
