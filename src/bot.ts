@@ -479,7 +479,7 @@ async function scan() {
 
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
-        const mcapMin = isNew ? 500 : 1000;
+        const mcapMin = isNew ? 5000 : 5000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 50000) continue;
