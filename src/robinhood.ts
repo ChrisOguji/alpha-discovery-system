@@ -247,7 +247,9 @@ export async function runPonsScan(
     ponsSeenTokens.add(c.tokenAddress);
 
     if (mcap < 3000 || mcap > 80000) continue;
-
+    if (liquidityUsd < 3000) continue;
+    if (snapshot.graduationProgress < 0.08) continue;
+    
     const ratio = mcap > 0 ? liquidityUsd / mcap : 0;
     let score = 0;
     if (ratio >= 0.30) score += 40;
@@ -260,7 +262,7 @@ export async function runPonsScan(
     else if (liquidityUsd >= 2000) score += 6;
     score = Math.min(100, Math.max(0, score));
 
-    if (score < 55) continue;
+    if (score < 75) continue;
 
     const msg = [
       `🚨 *AI DEGEN CALL — ROBINHOOD CHAIN (pons)* 🚨`, ``,
