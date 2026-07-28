@@ -854,8 +854,7 @@ bot.launch({
   process.exit(1);
 });
 
-bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals.'));
-
+bot.command('test', (ctx) => ctx.reply('✅ Bot online. Scanning pump.fun (via WSS) + PumpSwap + Early Detection + Reversals — plus Robinhood Chain (pons launchpad).'));
 bot.command('positions', async (ctx) => {
   if (openPositions.size === 0 && pendingEntries.size === 0) return ctx.reply('📭 No open positions.');
   const lines = ['📊 *Open Positions:*', ''];
