@@ -766,6 +766,8 @@ async function scan() {
         console.log(`❌ Error on token: ${innerErr.message}`);
       }
     }
+
+    await runPonsScan(bot, CHAT_ID);
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
   }
@@ -836,6 +838,7 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   await init();
   startPumpPortalStream();
+  startPonsFactoryListener();
   scan();
   setInterval(scan, 60000);
   setInterval(monitorPositions, 30 * 1000);
