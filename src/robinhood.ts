@@ -216,3 +216,69 @@ export async function getPonsTokenSnapshot(tokenAddress: string): Promise<PonsSn
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Self-contained alert pipeline for pons tokens — bot.ts only needs to call
+// runPonsScan() once per scan cycle. No auto-buy yet (that's a later step);
+// this just drains the queue, scores candidates, and sends Telegram alerts.
+// ─────────────────────────────────────────────────────────────────────────
+
+const ponsSeenTokens = new Set<string>();
+
+export async function runPonsScan(
+  bot: { telegram: { sendMessage: (chatId: string, text: string, extra?: any) => Promise<any> } },
+  chatId: string
+): Promise<void> {
+  const candidates = [...ponsTokenQueue];
+  ponsTokenQueue.length = 0;
+
+  for (const c of candidates) {
+    if (ponsSeenTokens.has(c.tokenAddress)) continue;
+
+    const snapshot = await getPonsTokenSnapshot(c.tokenAddress);
+    if (!snapshot || snapshot.marketCapUsd <= 0) {
+      ponsSeenTokens.add(c.tokenAddress);
+      continue;
+    }
+
+    const { marketCapUsd: mcap } = snapshot;
+    const ethUsd = await getEthUsd();
+    const liquidityUsd = snapshot.liquidityWeth * ethUsd;
+
+    ponsSeenTokens.add(c.tokenAddress);
+
+    if (mcap < 3000 || mcap > 80000) continue;
+
+    const ratio = mcap > 0 ? liquidityUsd / mcap : 0;
+    let score = 0;
+    if (ratio >= 0.30) score += 40;
+    else if (ratio >= 0.20) score += 30;
+    else if (ratio >= 0.10) score += 20;
+    else if (ratio >= 0.05) score += 10;
+    if (mcap >= 3000 && mcap <= 40000) score += 25;
+    if (liquidityUsd >= 10000) score += 20;
+    else if (liquidityUsd >= 5000) score += 12;
+    else if (liquidityUsd >= 2000) score += 6;
+    score = Math.min(100, Math.max(0, score));
+
+    if (score < 55) continue;
+
+    const msg = [
+      `🚨 *AI DEGEN CALL — ROBINHOOD CHAIN (pons)* 🚨`, ``,
+      `*Token:* $${c.ticker}`,
+      `*Address:* \`${c.tokenAddress}\``,
+      `*Market Cap:* $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+      `*Liquidity:* $${liquidityUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+      `*Score:* ${score}/100`,
+      `*Graduation:* ${(snapshot.graduationProgress * 100).toFixed(0)}%${snapshot.graduated ? ' ✅' : ''}`, ``,
+      `⚙️ Auto-buy isn't wired up on this chain yet — alert only for now.`, ``,
+      `📱 [View on pons](https://ponsfamily.com/launchpad)`,
+    ].join('\n');
+
+    try {
+      await bot.telegram.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+      console.log(`✅ pons alert sent: ${c.ticker} — score ${score}/100`);
+    } catch (e: any) {
+      console.log(`⚠️ Failed to send pons alert: ${e.message}`);
+    }
+  }
+}
