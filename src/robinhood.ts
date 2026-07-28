@@ -14,6 +14,11 @@ import { createPublicClient, http, parseAbi, parseAbiItem } from 'viem';
 //
 // Scoped intentionally to ONLY the pons factory — this does not scan any
 // other Robinhood Chain launchpad (Openfair, NOXA Fun, hood.fun, etc).
+//
+// Alert flow: launch detected -> wait 30-40 min -> re-check mcap/liquidity/
+// graduation/score fresh -> require a filled-out DexScreener profile (logo +
+// social/website) -> alert. Anything that never clears all four gets dropped
+// after 6 hours.
 // ─────────────────────────────────────────────────────────────────────────
 
 export const ROBINHOOD_CHAIN_ID = 4663;
@@ -219,37 +224,100 @@ export async function getPonsTokenSnapshot(tokenAddress: string): Promise<PonsSn
 // ─────────────────────────────────────────────────────────────────────────
 // Self-contained alert pipeline for pons tokens — bot.ts only needs to call
 // runPonsScan() once per scan cycle. No auto-buy yet (that's a later step);
-// this just drains the queue, scores candidates, and sends Telegram alerts.
+// this drains the launch queue, waits out the min age, scores, checks for a
+// filled-out DexScreener profile, then sends Telegram alerts.
 // ─────────────────────────────────────────────────────────────────────────
 
-const ponsSeenTokens = new Set<string>();
+const MIN_AGE_MS = 35 * 60 * 1000; // wait ~30-40 min after launch before evaluating
+const PENDING_MAX_AGE_MS = 6 * 60 * 60 * 1000; // give up on a candidate after 6 hours
+
+interface PonsPending extends PonsCandidate {
+  firstSeenAt: number;
+}
+const pendingQueue: PonsPending[] = [];
+const ponsSeenTokens = new Set<string>(); // sent or permanently dropped — won't be re-queued
+
+// ── Only alert once DexScreener shows a filled-out profile (logo + at least
+// one social/website link) — a decent signal the team is actually building,
+// not just deploying and disappearing. ──
+async function getDexScreenerEnrichment(tokenAddress: string): Promise<boolean> {
+  try {
+    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`, { timeout: 8000 });
+    const pair = (data?.pairs || []).find((p: any) => p.chainId === 'robinhood');
+    if (!pair) return false;
+    const hasImage = !!pair.info?.imageUrl;
+    const hasLinks = (pair.info?.socials?.length || 0) > 0 || (pair.info?.websites?.length || 0) > 0;
+    return hasImage && hasLinks;
+  } catch {
+    return false;
+  }
+}
+
+async function sendPonsAlert(
+  bot: { telegram: { sendMessage: (chatId: string, text: string, extra?: any) => Promise<any> } },
+  chatId: string,
+  c: { ticker: string; tokenAddress: string },
+  mcap: number,
+  liquidityUsd: number,
+  score: number,
+  graduationProgress: number,
+  graduated: boolean
+): Promise<void> {
+  const msg = [
+    `🚨 *AI DEGEN CALL — ROBINHOOD CHAIN (pons)* 🚨`, ``,
+    `*Token:* $${c.ticker}`,
+    `*Address:* \`${c.tokenAddress}\``,
+    `*Market Cap:* $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+    `*Liquidity:* $${liquidityUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+    `*Score:* ${score}/100`,
+    `*Graduation:* ${(graduationProgress * 100).toFixed(0)}%${graduated ? ' ✅' : ''}`, ``,
+    `⚙️ Auto-buy isn't wired up on this chain yet — alert only for now.`, ``,
+    `📱 [View on pons](https://ponsfamily.com/launchpad)`,
+  ].join('\n');
+
+  try {
+    await bot.telegram.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+    console.log(`✅ pons alert sent: ${c.ticker} — score ${score}/100`);
+  } catch (e: any) {
+    console.log(`⚠️ Failed to send pons alert: ${e.message}`);
+  }
+}
 
 export async function runPonsScan(
   bot: { telegram: { sendMessage: (chatId: string, text: string, extra?: any) => Promise<any> } },
   chatId: string
 ): Promise<void> {
-  const candidates = [...ponsTokenQueue];
+  // 1. Move anything newly detected onto the aging queue
+  const fresh = [...ponsTokenQueue];
   ponsTokenQueue.length = 0;
-
-  for (const c of candidates) {
+  for (const c of fresh) {
     if (ponsSeenTokens.has(c.tokenAddress)) continue;
+    pendingQueue.push({ ...c, firstSeenAt: Date.now() });
+  }
 
-    const snapshot = await getPonsTokenSnapshot(c.tokenAddress);
-    if (!snapshot || snapshot.marketCapUsd <= 0) {
-      ponsSeenTokens.add(c.tokenAddress);
+  // 2. Walk the aging queue — only evaluate tokens old enough, drop stale ones
+  for (let i = pendingQueue.length - 1; i >= 0; i--) {
+    const p = pendingQueue[i];
+    const age = Date.now() - p.firstSeenAt;
+
+    if (age > PENDING_MAX_AGE_MS) {
+      pendingQueue.splice(i, 1);
+      ponsSeenTokens.add(p.tokenAddress);
       continue;
     }
+    if (age < MIN_AGE_MS) continue; // still too fresh — check again next cycle
 
-    const { marketCapUsd: mcap } = snapshot;
+    const snapshot = await getPonsTokenSnapshot(p.tokenAddress);
+    if (!snapshot || snapshot.marketCapUsd <= 0) continue; // no liquidity yet or already rugged — keep trying until max age
+
     const ethUsd = await getEthUsd();
+    const mcap = snapshot.marketCapUsd;
     const liquidityUsd = snapshot.liquidityWeth * ethUsd;
-
-    ponsSeenTokens.add(c.tokenAddress);
 
     if (mcap < 3000 || mcap > 80000) continue;
     if (liquidityUsd < 3000) continue;
     if (snapshot.graduationProgress < 0.08) continue;
-    
+
     const ratio = mcap > 0 ? liquidityUsd / mcap : 0;
     let score = 0;
     if (ratio >= 0.30) score += 40;
@@ -264,23 +332,11 @@ export async function runPonsScan(
 
     if (score < 75) continue;
 
-    const msg = [
-      `🚨 *AI DEGEN CALL — ROBINHOOD CHAIN (pons)* 🚨`, ``,
-      `*Token:* $${c.ticker}`,
-      `*Address:* \`${c.tokenAddress}\``,
-      `*Market Cap:* $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-      `*Liquidity:* $${liquidityUsd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-      `*Score:* ${score}/100`,
-      `*Graduation:* ${(snapshot.graduationProgress * 100).toFixed(0)}%${snapshot.graduated ? ' ✅' : ''}`, ``,
-      `⚙️ Auto-buy isn't wired up on this chain yet — alert only for now.`, ``,
-      `📱 [View on pons](https://ponsfamily.com/launchpad)`,
-    ].join('\n');
+    const enriched = await getDexScreenerEnrichment(p.tokenAddress);
+    if (!enriched) continue; // keep waiting
 
-    try {
-      await bot.telegram.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
-      console.log(`✅ pons alert sent: ${c.ticker} — score ${score}/100`);
-    } catch (e: any) {
-      console.log(`⚠️ Failed to send pons alert: ${e.message}`);
-    }
+    pendingQueue.splice(i, 1);
+    ponsSeenTokens.add(p.tokenAddress);
+    await sendPonsAlert(bot, chatId, p, mcap, liquidityUsd, score, snapshot.graduationProgress, snapshot.graduated);
   }
 }
