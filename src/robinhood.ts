@@ -228,7 +228,7 @@ export async function getPonsTokenSnapshot(tokenAddress: string): Promise<PonsSn
 // filled-out DexScreener profile, then sends Telegram alerts.
 // ─────────────────────────────────────────────────────────────────────────
 
-const MIN_AGE_MS = 35 * 60 * 1000; // wait ~30-40 min after launch before evaluating
+const MIN_AGE_MS = 25 * 60 * 1000; // wait ~20-30 min after launch before evaluating
 const PENDING_MAX_AGE_MS = 6 * 60 * 60 * 1000; // give up on a candidate after 6 hours
 
 interface PonsPending extends PonsCandidate {
@@ -315,7 +315,7 @@ export async function runPonsScan(
     const liquidityUsd = snapshot.liquidityWeth * ethUsd;
 
     if (mcap < 3000 || mcap > 80000) continue;
-    if (liquidityUsd < 3000) continue;
+    if (liquidityUsd < 2500) continue;
     if (snapshot.graduationProgress < 0.08) continue;
 
     const ratio = mcap > 0 ? liquidityUsd / mcap : 0;
@@ -330,7 +330,7 @@ export async function runPonsScan(
     else if (liquidityUsd >= 2000) score += 6;
     score = Math.min(100, Math.max(0, score));
 
-    if (score < 75) continue;
+    if (score < 70) continue;
 
     const enriched = await getDexScreenerEnrichment(p.tokenAddress);
     if (!enriched) continue; // keep waiting
