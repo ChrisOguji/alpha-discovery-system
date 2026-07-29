@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import * as dotenv from 'dotenv';
 import axios from 'axios';
 import WebSocket from 'ws';
-import { Keypair } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { OnChainPatternRecognition } from './intelligence';
 import { CapitalRiskEngine } from './risk';
@@ -12,7 +12,7 @@ import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
-import { startPonsFactoryListener, runPonsScan } from './robinhood';
+import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
 const redis = new Redis(process.env.REDIS_URL || '');
 
@@ -767,7 +767,11 @@ async function scan() {
       }
     }
 
-    await runPonsScan(bot, CHAT_ID);
+    if (botSettings.robinhoodEnabled) {
+      await runPonsScan(bot, CHAT_ID);
+    } else {
+      console.log('⏭️ Robinhood scans disabled by settings');
+    }
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
   }
@@ -838,7 +842,9 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   await init();
   startPumpPortalStream();
-  startPonsFactoryListener();
+  if (botSettings.robinhoodEnabled) {
+    startPonsFactoryListener();
+  }
   scan();
   setInterval(scan, 60000);
   setInterval(monitorPositions, 30 * 1000);
@@ -1159,19 +1165,42 @@ bot.command('report', async (ctx) => {
   console.log(`📤 Report exported: ${alertHistory.size} trades`);
 });
 
+async function getWalletBalanceDisplay(): Promise<string> {
+  if (!executor.hasWallet()) return 'Not configured';
+
+  try {
+    const publicKey = executor.getWalletPublicKey();
+    const connection = new Connection(
+      process.env.SOLANA_RPC_URL || process.env.QUICKNODE_RPC_URL || 'https://api.mainnet-beta.solana.com',
+      'confirmed'
+    );
+    const balanceLamports = await connection.getBalance(new PublicKey(publicKey));
+    const balanceSol = balanceLamports / LAMPORTS_PER_SOL;
+    const formatter = new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 });
+    return `${formatter.format(balanceSol)} SOL`;
+  } catch (e: any) {
+    console.log(`⚠️ Could not fetch wallet balance: ${e.message}`);
+    return 'Unavailable';
+  }
+}
+
 // ── Helper: build settings panel message + keyboard ──
-function buildSettingsMessage() {
-  const walletLine = executor.hasWallet()
-    ? `🟢 *Wallet:* \`${executor.getWalletPublicKey().slice(0, 8)}...${executor.getWalletPublicKey().slice(-4)}\``
+async function buildSettingsMessage() {
+  const walletPublicKey = executor.hasWallet() ? executor.getWalletPublicKey() : null;
+  const walletLine = walletPublicKey
+    ? `🟢 *Wallet:* \`${walletPublicKey.slice(0, 8)}...${walletPublicKey.slice(-4)}\``
     : `🔴 *Wallet:* Not configured — auto\\-buy is disabled`;
+  const balanceDisplay = await getWalletBalanceDisplay();
 
   const text = [
     `⚙️ *Bot Settings*`, ``,
     walletLine,
+    `💵 *Balance:* ${balanceDisplay}`,
     `💰 *Trade Size:* ${botSettings.tradeSizeSol} SOL per trade`,
     `🎯 *Take Profit:* +${botSettings.takeProfitPct}%`,
     `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
     `⏳ *Delayed Entry:* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'} — buy held until $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP`,
+    `🪙 *Robinhood:* ${botSettings.robinhoodEnabled ? '✅ ON' : '❌ OFF'} — launchpad scans and listeners are ${botSettings.robinhoodEnabled ? 'active' : 'disabled'}`,
   ].join('\n');
 
   const keyboard = Markup.inlineKeyboard([
@@ -1183,6 +1212,10 @@ function buildSettingsMessage() {
       botSettings.delayedEntryEnabled ? '⏳ Delayed Entry: ON (tap to disable)' : '⏳ Delayed Entry: OFF (tap to enable)',
       'toggle_delayed_entry'
     )],
+    [Markup.button.callback(
+      botSettings.robinhoodEnabled ? '🪙 Robinhood: ON (tap to disable)' : '🪙 Robinhood: OFF (tap to enable)',
+      'toggle_robinhood'
+    )],
     [Markup.button.callback('🎯 Set Delayed Entry MCAP', 'set_delayed_entry_mcap')],
   ]);
 
@@ -1191,7 +1224,7 @@ function buildSettingsMessage() {
 
 // ── /settings ──
 bot.command('settings', async (ctx) => {
-  const { text, keyboard } = buildSettingsMessage();
+  const { text, keyboard } = await buildSettingsMessage();
   await ctx.reply(text, { parse_mode: 'Markdown', ...keyboard });
 });
 
@@ -1210,7 +1243,22 @@ bot.action('toggle_delayed_entry', async (ctx) => {
   await ctx.answerCbQuery();
   botSettings.delayedEntryEnabled = !botSettings.delayedEntryEnabled;
   await saveSetting(ctx.chat!.id.toString(), 'delayedEntryEnabled', botSettings.delayedEntryEnabled);
-  const { text, keyboard } = buildSettingsMessage();
+  const { text, keyboard } = await buildSettingsMessage();
+  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+});
+
+bot.action('toggle_robinhood', async (ctx) => {
+  await ctx.answerCbQuery();
+  botSettings.robinhoodEnabled = !botSettings.robinhoodEnabled;
+  await saveSetting(ctx.chat!.id.toString(), 'robinhoodEnabled', botSettings.robinhoodEnabled);
+
+  if (botSettings.robinhoodEnabled) {
+    startPonsFactoryListener();
+  } else {
+    stopPonsFactoryListener();
+  }
+
+  const { text, keyboard } = await buildSettingsMessage();
   await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
 });
 

@@ -376,7 +376,14 @@ export class LowLatencyExecutionEngine {
           jsonrpc: '2.0',
           id: 1,
           method: 'sendBundle',
-          params: [[tipEncoded, swapEncoded]]
+          // ── FIX: Jito's sendBundle defaults to expecting base58-encoded
+          // transactions. We're sending base64, so we must declare the
+          // encoding explicitly in the params config object, or Jito will
+          // fail to decode the payload and return HTTP 400.
+          params: [
+            [tipEncoded, swapEncoded],
+            { encoding: 'base64' }
+          ]
         },
         { timeout: 10000 }
       );
@@ -400,8 +407,18 @@ export class LowLatencyExecutionEngine {
       return this.fallbackToQuickNode(tx.serialize());
 
     } catch (e: any) {
-      // ── Network error — fall back to direct RPC ──
-      console.log(`⚠️ Jito unreachable, falling back to direct RPC: ${e.message}`);
+      // ── FIX: log the actual response body from Jito (not just e.message),
+      // since axios error messages for 4xx/5xx responses don't include the
+      // server's error payload by default. This is what actually tells you
+      // *why* Jito returned 400 (bad encoding, malformed tx, etc.) instead
+      // of just "unreachable", which was misleading — the request reached
+      // Jito fine, it was rejected.
+      const status = e.response?.status;
+      const body = e.response?.data;
+      console.log(
+        `⚠️ Jito request failed${status ? ` (HTTP ${status})` : ''}, falling back to direct RPC: ` +
+        `${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
+      );
       return this.fallbackToQuickNode(tx.serialize());
     }
   }
