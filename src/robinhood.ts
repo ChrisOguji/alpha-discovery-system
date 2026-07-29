@@ -69,6 +69,7 @@ export interface PonsCandidate {
 export const ponsTokenQueue: PonsCandidate[] = [];
 
 let lastPolledBlock: bigint | null = null;
+let ponsPollTimer: ReturnType<typeof setInterval> | null = null;
 
 // ── ETH/USD, cached — pons's own interface prices in USD via DeFiLlama, so we match that ──
 let cachedEthUsd = 0;
@@ -96,6 +97,8 @@ async function getEthUsd(): Promise<number> {
 // small bounded windows on an interval rather than subscribing to a websocket — Robinhood
 // Chain's public endpoint is HTTP-only.
 export function startPonsFactoryListener(pollIntervalMs = 5000): void {
+  if (ponsPollTimer) return;
+
   console.log('🔗 Starting pons factory listener on Robinhood Chain...');
 
   const poll = async () => {
@@ -153,7 +156,15 @@ export function startPonsFactoryListener(pollIntervalMs = 5000): void {
   };
 
   poll();
-  setInterval(poll, pollIntervalMs);
+  ponsPollTimer = setInterval(poll, pollIntervalMs);
+}
+
+export function stopPonsFactoryListener(): void {
+  if (ponsPollTimer) {
+    clearInterval(ponsPollTimer);
+    ponsPollTimer = null;
+  }
+  lastPolledBlock = null;
 }
 
 // ── Live price/mcap/graduation snapshot, read directly from chain state ──

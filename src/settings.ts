@@ -6,6 +6,7 @@ export interface BotSettings {
   stopLossPct: number;
   delayedEntryEnabled: boolean;
   delayedEntryMcap: number;
+  robinhoodEnabled: boolean;
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
@@ -14,6 +15,7 @@ export const DEFAULT_SETTINGS: BotSettings = {
   stopLossPct: 35,
   delayedEntryEnabled: false,
   delayedEntryMcap: 15000,
+  robinhoodEnabled: true,
 };
 
 export async function saveSetting(chatId: string, key: keyof BotSettings, value: number | boolean): Promise<void> {
@@ -23,6 +25,7 @@ export async function saveSetting(chatId: string, key: keyof BotSettings, value:
     stopLossPct: 'stop_loss_pct',
     delayedEntryEnabled: 'delayed_entry_enabled',
     delayedEntryMcap: 'delayed_entry_mcap',
+    robinhoodEnabled: 'robinhood_enabled',
   };
   const col = colMap[key];
   await db.query(
@@ -36,7 +39,7 @@ export async function saveSetting(chatId: string, key: keyof BotSettings, value:
 export async function loadSettings(chatId: string): Promise<BotSettings> {
   try {
     const res = await db.query(
-      'SELECT trade_size_sol, take_profit_pct, stop_loss_pct, delayed_entry_enabled, delayed_entry_mcap FROM bot_settings WHERE chat_id = $1',
+      'SELECT trade_size_sol, take_profit_pct, stop_loss_pct, delayed_entry_enabled, delayed_entry_mcap, robinhood_enabled FROM bot_settings WHERE chat_id = $1',
       [chatId]
     );
     if (!res.rows.length) return { ...DEFAULT_SETTINGS };
@@ -47,6 +50,7 @@ export async function loadSettings(chatId: string): Promise<BotSettings> {
       stopLossPct: Number(r.stop_loss_pct) || DEFAULT_SETTINGS.stopLossPct,
       delayedEntryEnabled: r.delayed_entry_enabled ?? DEFAULT_SETTINGS.delayedEntryEnabled,
       delayedEntryMcap: Number(r.delayed_entry_mcap) || DEFAULT_SETTINGS.delayedEntryMcap,
+      robinhoodEnabled: r.robinhood_enabled ?? DEFAULT_SETTINGS.robinhoodEnabled,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
