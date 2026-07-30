@@ -357,15 +357,14 @@ export class LowLatencyExecutionEngine {
 
   public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
-      // ── Tip amount: 0.001 SOL ──
-      const TIP_LAMPORTS = Math.floor(0.001 * LAMPORTS_PER_SOL);
+      // ── Tip bumped from 0.001 to 0.003 SOL — too-low tips get skipped by
+      // validators, especially during busy periods ──
+      const TIP_LAMPORTS = Math.floor(0.003 * LAMPORTS_PER_SOL);
 
-      // ── Extract blockhash from swap tx so both txs share the same one ──
       const swapBlockhash = tx.message.recentBlockhash;
       console.log('🎯 Building Jito tip transaction...');
       const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, swapBlockhash);
 
-      // ── Encode both transactions: tip first, swap second ──
       const tipEncoded  = Buffer.from(tipTx.serialize()).toString('base64');
       const swapEncoded = Buffer.from(tx.serialize()).toString('base64');
 
@@ -376,10 +375,6 @@ export class LowLatencyExecutionEngine {
           jsonrpc: '2.0',
           id: 1,
           method: 'sendBundle',
-          // ── FIX: Jito's sendBundle defaults to expecting base58-encoded
-          // transactions. We're sending base64, so we must declare the
-          // encoding explicitly in the params config object, or Jito will
-          // fail to decode the payload and return HTTP 400.
           params: [
             [tipEncoded, swapEncoded],
             { encoding: 'base64' }
@@ -392,27 +387,23 @@ export class LowLatencyExecutionEngine {
         const bundleId = res.data.result;
         console.log(`📦 Jito bundle sent: ${bundleId}`);
 
-        // ── Confirm bundle in background — scan continues immediately ──
-        this.confirmJitoBundle(bundleId).then(confirmed => {
-          if (confirmed) console.log(`✅ Jito bundle confirmed: ${bundleId}`);
-          else console.log(`⚠️ Jito bundle unconfirmed after 30s — check manually: ${bundleId}`);
-        });
+        // ── Actually wait for confirmation before reporting success — a
+        // bundle Jito accepted into queue but never landed is not a real trade ──
+        const confirmed = await this.confirmJitoBundle(bundleId);
+        if (confirmed) {
+          console.log(`✅ Jito bundle confirmed: ${bundleId}`);
+          return { success: true, bundleId };
+        }
 
-        return { success: true, bundleId };
+        console.log(`⚠️ Jito bundle unconfirmed after 30s, falling back to direct RPC: ${bundleId}`);
+        return this.fallbackToQuickNode(tx.serialize());
       }
 
-      // ── Jito rejected — fall back to direct RPC ──
       const jitoError = res.data?.error?.message || 'Jito rejected bundle';
       console.log(`⚠️ Jito rejected, falling back to direct RPC: ${jitoError}`);
       return this.fallbackToQuickNode(tx.serialize());
 
     } catch (e: any) {
-      // ── FIX: log the actual response body from Jito (not just e.message),
-      // since axios error messages for 4xx/5xx responses don't include the
-      // server's error payload by default. This is what actually tells you
-      // *why* Jito returned 400 (bad encoding, malformed tx, etc.) instead
-      // of just "unreachable", which was misleading — the request reached
-      // Jito fine, it was rejected.
       const status = e.response?.status;
       const body = e.response?.data;
       console.log(
@@ -423,27 +414,30 @@ export class LowLatencyExecutionEngine {
     }
   }
 
-  // ✅ Jito bundle confirmation — kept for future use if Jito tip is added
+  // ✅ Jito bundle confirmation — polls every 5s for up to 30 seconds
   private async confirmJitoBundle(bundleId: string): Promise<boolean> {
-    try {
+    for (let i = 0; i < 6; i++) {
       await new Promise(resolve => setTimeout(resolve, 5000));
-      const res = await this.client.post(
-        'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getBundleStatuses",
-          params: [[bundleId]]
-        },
-        { timeout: 8000 }
-      );
-      const status = res.data?.result?.value?.[0]?.confirmation_status;
-      return status === 'confirmed' || status === 'finalized';
-    } catch {
-      return false;
+      try {
+        const res = await this.client.post(
+          'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBundleStatuses",
+            params: [[bundleId]]
+          },
+          { timeout: 8000 }
+        );
+        const status = res.data?.result?.value?.[0]?.confirmation_status;
+        if (status === 'confirmed' || status === 'finalized') return true;
+      } catch {
+        // keep polling
+      }
     }
+    return false;
   }
-
+  
   // ✅ Direct RPC — returns signature immediately, confirms in background
   private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
