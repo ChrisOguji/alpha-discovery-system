@@ -438,7 +438,7 @@ export class LowLatencyExecutionEngine {
     return false;
   }
   
-  // ✅ Direct RPC — returns signature immediately, confirms in background
+  // ✅ Direct RPC — now waits for actual on-chain confirmation before reporting success
   private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
@@ -461,13 +461,14 @@ export class LowLatencyExecutionEngine {
         console.log(`📝 Tx signature: ${signature}`);
         console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
 
-        // ✅ Confirm in background — scan continues immediately
-        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
-          if (confirmed) console.log(`✅ Tx confirmed on-chain: ${signature}`);
-          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
-        });
+        const confirmed = await this.confirmTransaction(signature, rpcUrl);
+        if (confirmed) {
+          console.log(`✅ Tx confirmed on-chain: ${signature}`);
+          return { success: true, bundleId: signature };
+        }
 
-        return { success: true, bundleId: signature };
+        console.log(`⚠️ Tx not confirmed after 50s — treating as failed: https://solscan.io/tx/${signature}`);
+        return { success: false, error: 'Transaction not confirmed on-chain within 50s' };
       }
 
       return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
@@ -475,7 +476,7 @@ export class LowLatencyExecutionEngine {
       return { success: false, error: 'Fallback RPC network failure' };
     }
   }
-
+  
   // ✅ Background confirmation — 20 attempts over 50 seconds
   private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
     for (let i = 0; i < 20; i++) {
