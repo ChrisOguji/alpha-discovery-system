@@ -12,7 +12,7 @@ import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
-import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
+// import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
 const redis = new Redis(process.env.REDIS_URL || '');
 
