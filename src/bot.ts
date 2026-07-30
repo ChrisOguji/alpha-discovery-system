@@ -451,7 +451,7 @@ async function monitorPositions() {
               try {
                 await bot.telegram.sendMessage(
                   CHAT_ID,
-                  `${label.split(' ')[0]} *$${escapeText(rec.ticker)}* ${escapeText(label.split(' ').slice(1).join(' '))}`,
+                  `${label.split(' ')[0]} *$${escapeText(rec.ticker)}* ${label.split(' ').slice(1).join(' ')}`,
                   { parse_mode: 'Markdown' }
                 );
                 console.log(`📢 Milestone: ${rec.ticker} hit ${multiple}x`);
@@ -511,19 +511,7 @@ async function monitorPositions() {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
           const everPumped = peakGainPct >= 40;
-          const msg = [
-            everPumped
-              ? `🛑 *STOP LOSS — HIT \\(peaked \\+${peakGainPct.toFixed(0)}% before reversing\\)*`
-              : `🛑 *STOP LOSS — -${sl}% HIT \\(never gained traction\\)*`, ``,
-            `*Token:* $${escapeText(pos.ticker)}`,
-            `*Address:* \`${address}\``, ``,
-            `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
-            `*Exit Price:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* 🔴 ${pnlPct.toFixed(2)}%`,
-            `*Loss:* ${pnlSol.toFixed(4)} SOL`,
-            `*Size:* ${pos.sizeSol} SOL`,
-            `*Held:* ${holdingMins} minutes`,
-          ].join('\n');
+
           // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
           if (alertHistory.has(address)) {
             const rec = alertHistory.get(address)!;
@@ -537,8 +525,27 @@ async function monitorPositions() {
             await saveHistory();
           }
           openPositions.delete(address);
-          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
-          console.log(`✅ SL hit: ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+
+          // ── Only announce stop-loss for tokens that never gained real traction.
+          // A token that pumped 40%+ first already got milestone announcements —
+          // a stop-loss message on top of that is noise, not signal. ──
+          if (!everPumped) {
+            const msg = [
+              `🛑 *STOP LOSS — -${sl}% HIT \\(never gained traction\\)*`, ``,
+              `*Token:* $${escapeText(pos.ticker)}`,
+              `*Address:* \`${address}\``, ``,
+              `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
+              `*Exit Price:* $${currentPrice.toFixed(8)}`,
+              `*PnL:* 🔴 ${pnlPct.toFixed(2)}%`,
+              `*Loss:* ${pnlSol.toFixed(4)} SOL`,
+              `*Size:* ${pos.sizeSol} SOL`,
+              `*Held:* ${holdingMins} minutes`,
+            ].join('\n');
+            await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+            console.log(`✅ SL hit (announced): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          } else {
+            console.log(`✅ SL hit (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+          }
           return;
         }
 
@@ -550,6 +557,105 @@ async function monitorPositions() {
   }));
 
   await saveHistory();
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auto-posted digests — no command needed, fire on their own timers and
+// drop into the same chat as everything else. Skip posting if there's
+// nothing to show (no calls in the window) rather than send an empty digest.
+// ─────────────────────────────────────────────────────────────────────────
+
+function gainMultiple(rec: AlertRecord): number {
+  return rec.alertPrice > 0 ? rec.peakPrice / rec.alertPrice : 0;
+}
+
+async function postTopGainers(windowMs: number, title: string): Promise<void> {
+  const cutoff = Date.now() - windowMs;
+  const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
+  if (inWindow.length === 0) return;
+
+  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
+
+  const lines = [`🏆 *Top Gainers — ${escapeText(title)}*`, ``];
+  ranked.forEach((r, i) => {
+    lines.push(`${i + 1}\\. $${escapeText(r.ticker)} — ${gainMultiple(r).toFixed(1)}x`);
+  });
+
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, lines.join('\n'), { parse_mode: 'Markdown' });
+    console.log(`📢 Posted top gainers digest: ${title}`);
+  } catch (e: any) {
+    console.log(`⚠️ Failed to post top gainers digest: ${e.message}`);
+  }
+}
+
+async function postDailyRecap(): Promise<void> {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
+  if (inWindow.length === 0) return;
+
+  const wins = inWindow.filter(r => r.peakPrice > r.alertPrice).length;
+  const losses = inWindow.filter(r => r.exitReason === 'SL').length;
+  const gains = inWindow.map(r => ((r.peakPrice - r.alertPrice) / r.alertPrice) * 100);
+  const avgPeakPct = gains.reduce((a, b) => a + b, 0) / gains.length;
+
+  const best = inWindow.reduce((max: AlertRecord | null, r) =>
+    (!max || gainMultiple(r) > gainMultiple(max)) ? r : max, null);
+
+  const lines = [
+    `📈 *Daily Recap*`, ``,
+    `*Calls:* ${inWindow.length}`,
+    `*Wins:* ${wins}`,
+    `*Losses:* ${losses}`, ``,
+    `*Highest Gain:* ${best ? `${gainMultiple(best).toFixed(1)}x \\($${escapeText(best.ticker)}\\)` : 'N/A'}`,
+    `*Average Peak:* +${avgPeakPct.toFixed(1)}%`,
+  ];
+
+  try {
+    await bot.telegram.sendMessage(CHAT_ID, lines.join('\n'), { parse_mode: 'Markdown' });
+    console.log('📢 Posted daily recap');
+  } catch (e: any) {
+    console.log(`⚠️ Failed to post daily recap: ${e.message}`);
+  }
+}
+
+// ── Calendar-aligned scheduling — these fire at real clock boundaries
+// (UTC midnight, noon, Sunday midnight), not "24h after the bot last
+// restarted" ──
+function scheduleDaily(fn: () => void, hourUTC: number): void {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUTC, 0, 0, 0));
+  if (next.getTime() <= now.getTime()) next.setUTCDate(next.getUTCDate() + 1);
+  setTimeout(() => {
+    fn();
+    setInterval(fn, 24 * 60 * 60 * 1000);
+  }, next.getTime() - now.getTime());
+}
+
+function scheduleTwiceDaily(fn: () => void): void {
+  const now = new Date();
+  const candidates = [0, 12].map(h => {
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, 0, 0, 0));
+    if (d.getTime() <= now.getTime()) d.setUTCDate(d.getUTCDate() + 1);
+    return d.getTime();
+  });
+  const next = Math.min(...candidates);
+  setTimeout(() => {
+    fn();
+    setInterval(fn, 12 * 60 * 60 * 1000);
+  }, next - now.getTime());
+}
+
+function scheduleWeekly(fn: () => void, dayOfWeekUTC: number, hourUTC: number): void {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUTC, 0, 0, 0));
+  let daysUntil = (dayOfWeekUTC - next.getUTCDay() + 7) % 7;
+  if (daysUntil === 0 && next.getTime() <= now.getTime()) daysUntil = 7;
+  next.setUTCDate(next.getUTCDate() + daysUntil);
+  setTimeout(() => {
+    fn();
+    setInterval(fn, 7 * 24 * 60 * 60 * 1000);
+  }, next.getTime() - now.getTime());
 }
 
 async function scan() {
@@ -890,6 +996,11 @@ bot.launch({
   scan();
   setInterval(scan, 60000);
   setInterval(monitorPositions, 30 * 1000);
+  // ── Calendar-aligned: 12h digest fires at 00:00 & 12:00 UTC, daily recap at
+  // midnight UTC, weekly digest Sunday midnight UTC — not rolling from restart time ──
+  scheduleTwiceDaily(() => postTopGainers(12 * 60 * 60 * 1000, 'Last 12 Hours'));
+  scheduleWeekly(() => postTopGainers(7 * 24 * 60 * 60 * 1000, 'This Week'), 0, 0);
+  scheduleDaily(postDailyRecap, 0);
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
