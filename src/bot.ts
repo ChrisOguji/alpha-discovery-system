@@ -1246,7 +1246,6 @@ bot.action('toggle_delayed_entry', async (ctx) => {
 });
 
 bot.action('toggle_robinhood', async (ctx) => {
-bot.action('toggle_robinhood', async (ctx) => {
   await ctx.answerCbQuery('Robinhood Chain is temporarily disabled in code right now.');
 });
 
