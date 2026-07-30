@@ -767,11 +767,7 @@ async function scan() {
       }
     }
 
-    if (botSettings.robinhoodEnabled) {
-      await runPonsScan(bot, CHAT_ID);
-    } else {
-      console.log('⏭️ Robinhood scans disabled by settings');
-    }
+    console.log('⏭️ Robinhood scans disabled (temporarily off in code)');
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
   }
@@ -842,9 +838,11 @@ bot.launch({
   console.log(`🤖 Bot Live via Webhook on port ${PORT}`);
   await init();
   startPumpPortalStream();
-  if (botSettings.robinhoodEnabled) {
-    startPonsFactoryListener();
-  }
+  // Robinhood Chain temporarily disabled — re-enable by uncommenting the import
+  // at the top of this file and restoring this block.
+  // if (botSettings.robinhoodEnabled) {
+  //   startPonsFactoryListener();
+  // }
   scan();
   setInterval(scan, 60000);
   setInterval(monitorPositions, 30 * 1000);
@@ -1248,18 +1246,8 @@ bot.action('toggle_delayed_entry', async (ctx) => {
 });
 
 bot.action('toggle_robinhood', async (ctx) => {
-  await ctx.answerCbQuery();
-  botSettings.robinhoodEnabled = !botSettings.robinhoodEnabled;
-  await saveSetting(ctx.chat!.id.toString(), 'robinhoodEnabled', botSettings.robinhoodEnabled);
-
-  if (botSettings.robinhoodEnabled) {
-    startPonsFactoryListener();
-  } else {
-    stopPonsFactoryListener();
-  }
-
-  const { text, keyboard } = await buildSettingsMessage();
-  await ctx.editMessageText(text, { parse_mode: 'Markdown', ...keyboard });
+bot.action('toggle_robinhood', async (ctx) => {
+  await ctx.answerCbQuery('Robinhood Chain is temporarily disabled in code right now.');
 });
 
 // ── Callbacks: each button puts the chat into an awaiting state ──
