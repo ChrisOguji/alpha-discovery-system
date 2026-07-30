@@ -12,6 +12,7 @@ import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
+import { renderExitCard, renderMilestoneCard, renderRecapCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
 const redis = new Redis(process.env.REDIS_URL || '');
@@ -44,6 +45,28 @@ const riskEngine = new CapitalRiskEngine();
 const executor = new LowLatencyExecutionEngine();
 
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
+const DENGINE_NAME = 'Dengine';
+const TRADER_NAME = 'ChrisOG';
+
+// ── SOL/USD, cached — used to show $ amounts on exit cards ──
+let cachedSolUsd = 0;
+let cachedSolUsdAt = 0;
+const SOL_PRICE_TTL_MS = 60_000;
+async function getSolUsd(): Promise<number> {
+  const now = Date.now();
+  if (cachedSolUsd > 0 && now - cachedSolUsdAt < SOL_PRICE_TTL_MS) return cachedSolUsd;
+  try {
+    const res = await axios.get('https://coins.llama.fi/prices/current/coingecko:solana', { timeout: 5000 });
+    const price = res.data?.coins?.['coingecko:solana']?.price;
+    if (price > 0) {
+      cachedSolUsd = price;
+      cachedSolUsdAt = now;
+    }
+  } catch (e: any) {
+    console.log(`⚠️ SOL/USD fetch failed, using last cached value: ${e.message}`);
+  }
+  return cachedSolUsd;
+}
 const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
@@ -445,18 +468,38 @@ async function monitorPositions() {
         // ── Milestone announcements — fire once per threshold, based on peak reached ──
         if (rec.alertPrice > 0) {
           const gainMultiple = updated.peakPrice / rec.alertPrice;
-          for (const { multiple, label } of MILESTONE_THRESHOLDS) {
+          for (const { multiple } of MILESTONE_THRESHOLDS) {
             if (gainMultiple >= multiple && !updated.milestonesHit.includes(multiple)) {
               updated.milestonesHit = [...updated.milestonesHit, multiple];
+
+              // ── +50% stays plain text — only 2x and above get an image card ──
+              if (multiple < 2) {
+                try {
+                  await bot.telegram.sendMessage(
+                    CHAT_ID,
+                    `🚀 *$${escapeText(rec.ticker)}* is now \\+50%`,
+                    { parse_mode: 'Markdown' }
+                  );
+                  console.log(`📢 Milestone (text): ${rec.ticker} hit ${multiple}x`);
+                } catch (e: any) {
+                  console.log(`⚠️ Failed to send milestone text: ${e.message}`);
+                }
+                continue;
+              }
+
               try {
-                await bot.telegram.sendMessage(
-                  CHAT_ID,
-                  `${label.split(' ')[0]} *$${escapeText(rec.ticker)}* ${label.split(' ').slice(1).join(' ')}`,
-                  { parse_mode: 'Markdown' }
-                );
-                console.log(`📢 Milestone: ${rec.ticker} hit ${multiple}x`);
+                const card = await renderMilestoneCard({
+                  botName: DENGINE_NAME,
+                  ticker: rec.ticker,
+                  multiple,
+                  alertMcap: rec.alertMcap,
+                  peakMcap: updated.peakMcap,
+                  pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
+                });
+                await bot.telegram.sendPhoto(CHAT_ID, { source: card });
+                console.log(`📢 Milestone (card): ${rec.ticker} hit ${multiple}x`);
               } catch (e: any) {
-                console.log(`⚠️ Failed to send milestone alert: ${e.message}`);
+                console.log(`⚠️ Failed to send milestone card: ${e.message}`);
               }
             }
           }
@@ -479,20 +522,31 @@ async function monitorPositions() {
         // ── TAKE PROFIT ──
         if (pnlPct >= tp) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
-          const msg = [
-            `🎯 *TAKE PROFIT — +${tp}% HIT*`, ``,
-            `*Token:* $${escapeText(pos.ticker)}`,
-            `*Entry:* $${pos.entryPrice.toFixed(8)}`,
-            `*Exit:* $${currentPrice.toFixed(8)}`,
-            `*PnL:* 🟢 +${pnlPct.toFixed(2)}%`,
-            `*Profit:* +${pnlSol.toFixed(4)} SOL`,
-            `*Held:* ${holdingMins} minutes`,
-          ].join('\n');
+          const solUsd = await getSolUsd();
+          const rec = alertHistory.get(address);
+          try {
+            const card = await renderExitCard({
+              type: 'TP',
+              botName: DENGINE_NAME,
+              traderName: TRADER_NAME,
+              ticker: pos.ticker,
+              investedSol: pos.sizeSol,
+              investedUsd: pos.sizeSol * solUsd,
+              pnlSol,
+              pnlUsd: pnlSol * solUsd,
+              pnlPct,
+              entryMcap: rec?.alertMcap || 0,
+              exitMcap: currentMcap,
+              heldMinutes: holdingMins,
+            });
+            await bot.telegram.sendPhoto(CHAT_ID, { source: card });
+          } catch (e: any) {
+            console.log(`⚠️ Failed to send TP card: ${e.message}`);
+          }
           // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
           if (alertHistory.has(address)) {
-            const rec = alertHistory.get(address)!;
             setAlert(address, {
-              ...rec,
+              ...rec!,
               exitReason: 'TP',
               exitPrice: currentPrice,
               exitMcap: currentMcap,
@@ -501,7 +555,6 @@ async function monitorPositions() {
             await saveHistory();
           }
           openPositions.delete(address);
-          await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
           console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
           return;
         }
@@ -511,12 +564,12 @@ async function monitorPositions() {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
           const everPumped = peakGainPct >= 40;
+          const rec = alertHistory.get(address);
 
           // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
           if (alertHistory.has(address)) {
-            const rec = alertHistory.get(address)!;
             setAlert(address, {
-              ...rec,
+              ...rec!,
               exitReason: 'SL',
               exitPrice: currentPrice,
               exitMcap: currentMcap,
@@ -527,21 +580,29 @@ async function monitorPositions() {
           openPositions.delete(address);
 
           // ── Only announce stop-loss for tokens that never gained real traction.
-          // A token that pumped 40%+ first already got milestone announcements —
-          // a stop-loss message on top of that is noise, not signal. ──
+          // A token that pumped 40%+ first already got milestone cards —
+          // a stop-loss card on top of that is noise, not signal. ──
           if (!everPumped) {
-            const msg = [
-              `🛑 *STOP LOSS — -${sl}% HIT \\(never gained traction\\)*`, ``,
-              `*Token:* $${escapeText(pos.ticker)}`,
-              `*Address:* \`${address}\``, ``,
-              `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
-              `*Exit Price:* $${currentPrice.toFixed(8)}`,
-              `*PnL:* 🔴 ${pnlPct.toFixed(2)}%`,
-              `*Loss:* ${pnlSol.toFixed(4)} SOL`,
-              `*Size:* ${pos.sizeSol} SOL`,
-              `*Held:* ${holdingMins} minutes`,
-            ].join('\n');
-            await bot.telegram.sendMessage(CHAT_ID, msg, { parse_mode: 'Markdown' });
+            try {
+              const solUsd = await getSolUsd();
+              const card = await renderExitCard({
+                type: 'SL',
+                botName: DENGINE_NAME,
+                traderName: TRADER_NAME,
+                ticker: pos.ticker,
+                investedSol: pos.sizeSol,
+                investedUsd: pos.sizeSol * solUsd,
+                pnlSol,
+                pnlUsd: pnlSol * solUsd,
+                pnlPct,
+                entryMcap: rec?.alertMcap || 0,
+                exitMcap: currentMcap,
+                heldMinutes: holdingMins,
+              });
+              await bot.telegram.sendPhoto(CHAT_ID, { source: card });
+            } catch (e: any) {
+              console.log(`⚠️ Failed to send SL card: ${e.message}`);
+            }
             console.log(`✅ SL hit (announced): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
           } else {
             console.log(`✅ SL hit (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
@@ -575,47 +636,48 @@ async function postTopGainers(windowMs: number, title: string): Promise<void> {
   if (inWindow.length === 0) return;
 
   const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
-
-  const lines = [`🏆 *Top Gainers — ${escapeText(title)}*`, ``];
-  ranked.forEach((r, i) => {
-    lines.push(`${i + 1}\\. $${escapeText(r.ticker)} — ${gainMultiple(r).toFixed(1)}x`);
-  });
+  const hero = ranked[0];
 
   try {
-    await bot.telegram.sendMessage(CHAT_ID, lines.join('\n'), { parse_mode: 'Markdown' });
+    const card = await renderRecapCard({
+      botName: DENGINE_NAME,
+      periodTitle: `Top Gainers — ${title}`,
+      heroTicker: hero.ticker,
+      heroMultiple: gainMultiple(hero),
+      list: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+      statsLine: `${inWindow.length} calls in this window`,
+    });
+    await bot.telegram.sendPhoto(CHAT_ID, { source: card });
     console.log(`📢 Posted top gainers digest: ${title}`);
   } catch (e: any) {
     console.log(`⚠️ Failed to post top gainers digest: ${e.message}`);
   }
 }
 
-async function postDailyRecap(): Promise<void> {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
+  const cutoff = Date.now() - windowMs;
   const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
   if (inWindow.length === 0) return;
 
   const wins = inWindow.filter(r => r.peakPrice > r.alertPrice).length;
   const losses = inWindow.filter(r => r.exitReason === 'SL').length;
-  const gains = inWindow.map(r => ((r.peakPrice - r.alertPrice) / r.alertPrice) * 100);
-  const avgPeakPct = gains.reduce((a, b) => a + b, 0) / gains.length;
-
-  const best = inWindow.reduce((max: AlertRecord | null, r) =>
-    (!max || gainMultiple(r) > gainMultiple(max)) ? r : max, null);
-
-  const lines = [
-    `📈 *Daily Recap*`, ``,
-    `*Calls:* ${inWindow.length}`,
-    `*Wins:* ${wins}`,
-    `*Losses:* ${losses}`, ``,
-    `*Highest Gain:* ${best ? `${gainMultiple(best).toFixed(1)}x \\($${escapeText(best.ticker)}\\)` : 'N/A'}`,
-    `*Average Peak:* +${avgPeakPct.toFixed(1)}%`,
-  ];
+  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
+  const hero = ranked[0];
+  if (!hero) return;
 
   try {
-    await bot.telegram.sendMessage(CHAT_ID, lines.join('\n'), { parse_mode: 'Markdown' });
-    console.log('📢 Posted daily recap');
+    const card = await renderRecapCard({
+      botName: DENGINE_NAME,
+      periodTitle,
+      heroTicker: hero.ticker,
+      heroMultiple: gainMultiple(hero),
+      list: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+      statsLine: `${inWindow.length} calls · ${wins} wins · ${losses} losses`,
+    });
+    await bot.telegram.sendPhoto(CHAT_ID, { source: card });
+    console.log(`📢 Posted ${periodTitle}`);
   } catch (e: any) {
-    console.log(`⚠️ Failed to post daily recap: ${e.message}`);
+    console.log(`⚠️ Failed to post ${periodTitle}: ${e.message}`);
   }
 }
 
@@ -656,6 +718,20 @@ function scheduleWeekly(fn: () => void, dayOfWeekUTC: number, hourUTC: number): 
     fn();
     setInterval(fn, 7 * 24 * 60 * 60 * 1000);
   }, next.getTime() - now.getTime());
+}
+
+// ── Months vary in length, so this recalculates the next 1st-of-month
+// boundary each time rather than using a fixed-interval setInterval ──
+function scheduleMonthly(fn: () => void, hourUTC: number): void {
+  const runAndReschedule = () => {
+    fn();
+    const now = new Date();
+    const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, hourUTC, 0, 0, 0));
+    setTimeout(runAndReschedule, next.getTime() - now.getTime());
+  };
+  const now = new Date();
+  const firstRun = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, hourUTC, 0, 0, 0));
+  setTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
 }
 
 async function scan() {
@@ -880,8 +956,8 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
-          `*Token:* $${escapeText(ticker)}`,
+          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
+          `*Ticker:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
@@ -999,8 +1075,9 @@ bot.launch({
   // ── Calendar-aligned: 12h digest fires at 00:00 & 12:00 UTC, daily recap at
   // midnight UTC, weekly digest Sunday midnight UTC — not rolling from restart time ──
   scheduleTwiceDaily(() => postTopGainers(12 * 60 * 60 * 1000, 'Last 12 Hours'));
-  scheduleWeekly(() => postTopGainers(7 * 24 * 60 * 60 * 1000, 'This Week'), 0, 0);
-  scheduleDaily(postDailyRecap, 0);
+  scheduleWeekly(() => postRecap(7 * 24 * 60 * 60 * 1000, 'Weekly Recap'), 0, 0);
+  scheduleDaily(() => postRecap(24 * 60 * 60 * 1000, 'Daily Recap'), 0);
+  scheduleMonthly(() => postRecap(30 * 24 * 60 * 60 * 1000, 'Monthly Recap'), 0);
   setInterval(async () => {
     try {
       await axios.get(DOMAIN, { timeout: 5000 });
