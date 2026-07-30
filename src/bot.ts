@@ -124,7 +124,21 @@ interface AlertRecord {
   exitPrice?: number;
   exitMcap?: number;
   exitTime?: number;
+  milestonesHit: number[];
 }
+
+// ── Milestone thresholds as multiples of alert price, with their announcement text ──
+const MILESTONE_THRESHOLDS: { multiple: number; label: string }[] = [
+  { multiple: 1.5, label: '🚀 is now +50%' },
+  { multiple: 2, label: '🚀 just crossed 2X' },
+  { multiple: 3, label: '🔥 reached 3X' },
+  { multiple: 5, label: '🔥 reached 5X' },
+  { multiple: 10, label: '💎 reached 10X' },
+  { multiple: 20, label: '👑 reached 20X' },
+  { multiple: 30, label: '👑 reached 30X' },
+  { multiple: 50, label: '👑 reached 50X' },
+  { multiple: 100, label: '🏆 reached 100X' },
+];
 let alertHistory = new Map<string, AlertRecord>();
 // ── Finding 6: only addresses touched since the last save get upserted to Postgres ──
 const dirtyAddresses = new Set<string>();
@@ -152,7 +166,7 @@ async function loadHistory() {
     const result = await db.query(`
       SELECT address, ticker, alert_time, alert_mcap, alert_price,
              peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-             exit_reason, exit_price, exit_mcap, exit_time
+             exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
       FROM alert_history ORDER BY alert_time DESC LIMIT 500
     `);
     for (const row of result.rows) {
@@ -172,7 +186,8 @@ async function loadHistory() {
         exitReason: row.exit_reason || undefined,
         exitPrice: row.exit_price != null ? Number(row.exit_price) : undefined,
         exitMcap: row.exit_mcap != null ? Number(row.exit_mcap) : undefined,
-        exitTime: row.exit_time != null ? Number(row.exit_time) : undefined
+        exitTime: row.exit_time != null ? Number(row.exit_time) : undefined,
+        milestonesHit: Array.isArray(row.milestones_hit) ? row.milestones_hit : []
       });
     }
     console.log(`✅ History loaded from Supabase: ${alertHistory.size} records`);
@@ -204,8 +219,8 @@ async function saveHistory() {
         INSERT INTO alert_history (
           address, ticker, alert_time, alert_mcap, alert_price,
           peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-          exit_reason, exit_price, exit_mcap, exit_time
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+          exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
         ON CONFLICT (address) DO UPDATE SET
           peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap),
           peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price),
@@ -217,11 +232,13 @@ async function saveHistory() {
           exit_reason = EXCLUDED.exit_reason,
           exit_price = EXCLUDED.exit_price,
           exit_mcap = EXCLUDED.exit_mcap,
-          exit_time = EXCLUDED.exit_time
+          exit_time = EXCLUDED.exit_time,
+          milestones_hit = EXCLUDED.milestones_hit
       `, [
         rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
         rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated,
-        rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null
+        rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null,
+        JSON.stringify(rec.milestonesHit || [])
       ]);
       dirtyAddresses.delete(address);
     } catch (e: any) {
@@ -417,13 +434,34 @@ async function monitorPositions() {
 
       if (alertHistory.has(address)) {
         const rec = alertHistory.get(address)!;
-        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now };
+        const updated: AlertRecord = { ...rec, currentPrice, currentMcap, lastUpdated: now, milestonesHit: rec.milestonesHit || [] };
         if (currentPrice > rec.peakPrice) {
           updated.peakPrice = currentPrice;
           updated.peakMcap = currentMcap;
           updated.peakTime = now;
           console.log(`📈 New peak ${rec.ticker}: $${currentPrice.toFixed(8)} (+${(((currentPrice - rec.alertPrice) / rec.alertPrice) * 100).toFixed(1)}%)`);
         }
+
+        // ── Milestone announcements — fire once per threshold, based on peak reached ──
+        if (rec.alertPrice > 0) {
+          const gainMultiple = updated.peakPrice / rec.alertPrice;
+          for (const { multiple, label } of MILESTONE_THRESHOLDS) {
+            if (gainMultiple >= multiple && !updated.milestonesHit.includes(multiple)) {
+              updated.milestonesHit = [...updated.milestonesHit, multiple];
+              try {
+                await bot.telegram.sendMessage(
+                  CHAT_ID,
+                  `${label.split(' ')[0]} *$${escapeText(rec.ticker)}* ${escapeText(label.split(' ').slice(1).join(' '))}`,
+                  { parse_mode: 'Markdown' }
+                );
+                console.log(`📢 Milestone: ${rec.ticker} hit ${multiple}x`);
+              } catch (e: any) {
+                console.log(`⚠️ Failed to send milestone alert: ${e.message}`);
+              }
+            }
+          }
+        }
+
         setAlert(address, updated);
       }
 
@@ -471,8 +509,12 @@ async function monitorPositions() {
         // ── STOP LOSS ──
         if (pnlPct <= -sl) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
+          const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
+          const everPumped = peakGainPct >= 40;
           const msg = [
-            `🛑 *STOP LOSS — -${sl}% HIT*`, ``,
+            everPumped
+              ? `🛑 *STOP LOSS — HIT \\(peaked \\+${peakGainPct.toFixed(0)}% before reversing\\)*`
+              : `🛑 *STOP LOSS — -${sl}% HIT \\(never gained traction\\)*`, ``,
             `*Token:* $${escapeText(pos.ticker)}`,
             `*Address:* \`${address}\``, ``,
             `*Entry Price:* $${pos.entryPrice.toFixed(8)}`,
@@ -710,7 +752,8 @@ async function scan() {
             peakTime: Date.now(),
             currentMcap: mcap,
             currentPrice,
-            lastUpdated: Date.now()
+            lastUpdated: Date.now(),
+            milestonesHit: []
           });
           await saveHistory();
         }
@@ -803,6 +846,7 @@ async function init() {
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_price NUMERIC`);
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_mcap NUMERIC`);
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_time BIGINT`);
+    await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS milestones_hit JSONB DEFAULT '[]'::jsonb`);
     console.log('✅ alert_history table ready');
   } catch (e: any) {
     console.log(`⚠️ alert_history table setup failed: ${e.message}`);
