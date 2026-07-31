@@ -12,7 +12,7 @@ import { saveEncryptedWallet, loadDecryptedWallet } from './wallet';
 import { saveSetting, loadSettings, BotSettings, DEFAULT_SETTINGS } from './settings';
 import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
-import { renderExitCard, renderMilestoneCard, renderRecapCard } from './cards';
+import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
 
 const redis = new Redis(process.env.REDIS_URL || '');
@@ -1339,6 +1339,27 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
     parse_mode: 'Markdown',
     ...Markup.inlineKeyboard(result.buttons)
   });
+
+  // ── Also send a peak/stop-loss card — same text report as always, this
+  // just adds the visual on top of it ──
+  const rec = alertHistory.get(address);
+  if (rec && rec.alertPrice > 0) {
+    const peakPct = ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
+    try {
+      const card = await renderCallResultCard({
+        botName: DENGINE_NAME,
+        ticker: rec.ticker,
+        alertMcap: rec.alertMcap,
+        peakMcap: rec.peakMcap,
+        peakPct,
+        multiple: rec.peakPrice / rec.alertPrice,
+        neverPumped: peakPct < 30,
+      });
+      await bot.telegram.sendPhoto(ctx.chat!.id, { source: card });
+    } catch (e: any) {
+      console.log(`⚠️ Failed to send PnL card: ${e.message}`);
+    }
+  }
 });
 
 // ✅ Refresh handler for individual token PnL
