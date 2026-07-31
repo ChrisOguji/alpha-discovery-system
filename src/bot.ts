@@ -644,7 +644,8 @@ async function postTopGainers(windowMs: number, title: string): Promise<void> {
       periodTitle: `Top Gainers — ${title}`,
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
-      list: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+      gainers: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+      losses: [],
       statsLine: `${inWindow.length} calls in this window`,
     });
     await bot.telegram.sendPhoto(CHAT_ID, { source: card });
@@ -660,10 +661,18 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
   if (inWindow.length === 0) return;
 
   const wins = inWindow.filter(r => r.peakPrice > r.alertPrice).length;
-  const losses = inWindow.filter(r => r.exitReason === 'SL').length;
-  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
-  const hero = ranked[0];
+  const slExits = inWindow.filter(r => r.exitReason === 'SL' && r.exitPrice != null);
+  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
+  const hero = gainersRanked[0];
   if (!hero) return;
+
+  // ── Real losses — based on actual exit price vs alert price, not peak
+  // (peak can never be below alert price, so it can't show a loss) ──
+  const lossesRanked = slExits
+    .map(r => ({ ticker: r.ticker, lossPct: ((r.exitPrice! - r.alertPrice) / r.alertPrice) * 100 }))
+    .filter(l => l.lossPct < 0)
+    .sort((a, b) => a.lossPct - b.lossPct)
+    .slice(0, 3);
 
   try {
     const card = await renderRecapCard({
@@ -671,8 +680,9 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
       periodTitle,
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
-      list: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
-      statsLine: `${inWindow.length} calls · ${wins} wins · ${losses} losses`,
+      gainers: gainersRanked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+      losses: lossesRanked,
+      statsLine: `${inWindow.length} calls · ${wins} wins · ${slExits.length} losses`,
     });
     await bot.telegram.sendPhoto(CHAT_ID, { source: card });
     console.log(`📢 Posted ${periodTitle}`);
@@ -956,8 +966,8 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
-          `*Ticker:* $${escapeText(ticker)}`,
+          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
+          `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
