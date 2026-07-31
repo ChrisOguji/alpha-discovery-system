@@ -350,3 +350,60 @@ export async function renderRecapCard(p: RecapCardParams): Promise<Buffer> {
 
   return canvas.toBuffer('image/png');
 }
+
+// ── Card 4: Call result card — shown when someone taps a token from the
+// /pnl list. Mirrors the milestone card visually. If the token ever
+// crossed +30% at peak, shows the peak multiplier; if it never did,
+// shows a stop-loss-styled card instead. This has no invested/profit
+// fields (unlike the exit card) since a "call" isn't always a real
+// executed position — it's just tracking peak performance. ──
+export interface CallResultCardParams {
+  botName: string;
+  ticker: string;
+  alertMcap: number;
+  peakMcap: number;
+  peakPct: number;
+  multiple: number;
+  neverPumped: boolean;
+  logoUrl?: string;
+}
+
+export async function renderCallResultCard(p: CallResultCardParams): Promise<Buffer> {
+  const accent = p.neverPumped ? RED : (p.multiple >= 10 ? GOLD : PURPLE);
+  const canvas = createCanvas(WIDTH, HEIGHT);
+  const ctx = canvas.getContext('2d');
+
+  drawBackground(ctx, accent);
+  drawHeader(ctx, p.botName, p.neverPumped ? 'STOP LOSS' : 'PEAK PERFORMANCE', accent);
+
+  await drawTokenLogo(ctx, p.logoUrl, p.ticker, 130, 200, 64, accent);
+
+  ctx.font = font(56);
+  ctx.fillStyle = TEXT_PRIMARY;
+  ctx.fillText(`$${p.ticker}`, 220, 165);
+
+  ctx.font = font(22);
+  ctx.fillStyle = TEXT_MUTED;
+  ctx.fillText(
+    p.neverPumped ? 'Never reached +30%' : `${p.peakPct >= 0 ? '+' : ''}${p.peakPct.toFixed(1)}% at peak`,
+    220, 225
+  );
+
+  if (p.neverPumped) {
+    ctx.font = font(110);
+    ctx.fillStyle = accent;
+    ctx.fillText(`${p.peakPct >= 0 ? '+' : ''}${p.peakPct.toFixed(1)}%`, 56, 290);
+  } else {
+    ctx.font = font(150);
+    ctx.fillStyle = accent;
+    ctx.fillText(`${p.multiple.toFixed(1)}X`, 56, 300);
+  }
+
+  const stats = [
+    { label: 'Alert MC', value: fmtUsd(p.alertMcap) },
+    { label: 'Peak MC', value: fmtUsd(p.peakMcap) },
+  ];
+  drawStatGrid(ctx, stats, p.neverPumped ? 460 : 500);
+
+  return canvas.toBuffer('image/png');
+}
