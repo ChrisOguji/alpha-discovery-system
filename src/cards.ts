@@ -1,26 +1,50 @@
-import { createCanvas, loadImage, Image } from '@napi-rs/canvas';
+import { createCanvas, loadImage, Image, GlobalFonts } from '@napi-rs/canvas';
 import axios from 'axios';
+import * as path from 'path';
+import * as fs from 'fs';
 
 // ─────────────────────────────────────────────────────────────────────────
 // Card image generator for Dengine.
 //
-// Deliberately avoids emoji glyphs INSIDE the rendered image — headless
-// Linux containers (Railway included) usually don't have a color-emoji font
-// installed, so emoji drawn via canvas render as empty boxes. Emoji are
-// fine in the Telegram message text/caption (Telegram's own client renders
-// those), just not baked into the PNG itself. Labels use plain text +
-// color instead ("TAKE PROFIT" on green, "STOP LOSS" on red, etc).
+// FONT: headless Linux containers (Railway included) often ship with zero
+// system fonts — canvas doesn't error on this, it just silently draws no
+// text at all, which is why cards were showing as empty colored boxes.
+// Fix: bundle a font file directly in the repo so this never depends on
+// what the server happens to have installed.
 //
-// No custom fonts or artwork are registered — this uses the system's
-// default sans-serif font. Clean and readable, not a designed illustration.
-// Drop TTF files in and call GlobalFonts.registerFromPath() to upgrade the
-// look later.
+// Put a .ttf file at assets/fonts/CardFont.ttf in the repo root (same
+// level as src/). Any font works — one bold/semibold weight is enough
+// since everything on the card uses this single family.
+//
+// Emoji are deliberately NOT drawn inside the image itself (same
+// reasoning — no color-emoji font on the server). Labels use plain text +
+// color instead. Emoji are fine in the Telegram message text/caption,
+// just not baked into the PNG.
 // ─────────────────────────────────────────────────────────────────────────
+
+const FONT_PATH = path.join(process.cwd(), 'assets', 'fonts', 'CardFont.ttf');
+const FONT_FAMILY = 'CardFont';
+let fontReady = false;
+
+try {
+  if (fs.existsSync(FONT_PATH)) {
+    GlobalFonts.registerFromPath(FONT_PATH, FONT_FAMILY);
+    fontReady = true;
+    console.log('✅ Card font registered');
+  } else {
+    console.log(`⚠️ Card font not found at ${FONT_PATH} — cards will render with blank text until it's added`);
+  }
+} catch (e: any) {
+  console.log(`⚠️ Card font registration failed: ${e.message}`);
+}
+
+function font(size: number): string {
+  return `${size}px ${FONT_FAMILY}`;
+}
 
 const WIDTH = 1200;
 const HEIGHT = 675;
 const BG = '#0B0E14';
-const PANEL = '#12161F';
 const TEXT_PRIMARY = '#F5F7FA';
 const TEXT_MUTED = '#8B94A3';
 const GREEN = '#22C55E';
@@ -60,14 +84,12 @@ function drawBackground(ctx: any, accent: string) {
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-  // Subtle accent glow top-right corner
   const grad = ctx.createRadialGradient(WIDTH - 100, 80, 0, WIDTH - 100, 80, 500);
   grad.addColorStop(0, accent + '33');
   grad.addColorStop(1, accent + '00');
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
-  // Card border
   ctx.strokeStyle = accent;
   ctx.lineWidth = 4;
   roundRect(ctx, 12, 12, WIDTH - 24, HEIGHT - 24, 28);
@@ -76,16 +98,15 @@ function drawBackground(ctx: any, accent: string) {
 
 function drawHeader(ctx: any, botName: string, badgeText: string, badgeColor: string) {
   ctx.fillStyle = TEXT_PRIMARY;
-  ctx.font = 'bold 34px sans-serif';
+  ctx.font = font(34);
   ctx.textBaseline = 'top';
   ctx.fillText(botName, 56, 48);
 
-  ctx.font = '20px sans-serif';
+  ctx.font = font(20);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText('onchain alpha tracker', 56, 92);
 
-  // Badge, top-right
-  ctx.font = 'bold 26px sans-serif';
+  ctx.font = font(26);
   const padX = 24;
   const badgeW = ctx.measureText(badgeText).width + padX * 2;
   const badgeX = WIDTH - 56 - badgeW;
@@ -107,11 +128,11 @@ function drawStatGrid(ctx: any, stats: { label: string; value: string }[], y: nu
     const x = 56 + col * colWidth;
     const rowY = y + row * 90;
 
-    ctx.font = '20px sans-serif';
+    ctx.font = font(20);
     ctx.fillStyle = TEXT_MUTED;
     ctx.fillText(s.label.toUpperCase(), x, rowY);
 
-    ctx.font = 'bold 32px sans-serif';
+    ctx.font = font(32);
     ctx.fillStyle = TEXT_PRIMARY;
     ctx.fillText(s.value, x, rowY + 30);
   });
@@ -131,7 +152,7 @@ async function drawTokenLogo(ctx: any, logoUrl: string | undefined, ticker: stri
     ctx.fill();
     ctx.clip();
     ctx.fillStyle = accent;
-    ctx.font = `bold ${Math.floor(r)}px sans-serif`;
+    ctx.font = font(Math.floor(r));
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText((ticker[0] || '?').toUpperCase(), cx, cy + 4);
@@ -174,15 +195,15 @@ export async function renderExitCard(p: ExitCardParams): Promise<Buffer> {
 
   await drawTokenLogo(ctx, p.logoUrl, p.ticker, 130, 200, 64, accent);
 
-  ctx.font = 'bold 56px sans-serif';
+  ctx.font = font(56);
   ctx.fillStyle = TEXT_PRIMARY;
   ctx.fillText(`$${p.ticker}`, 220, 165);
 
-  ctx.font = '22px sans-serif';
+  ctx.font = font(22);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText(`Called by ${p.traderName}`, 220, 225);
 
-  ctx.font = 'bold 110px sans-serif';
+  ctx.font = font(110);
   ctx.fillStyle = accent;
   const pctText = `${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}%`;
   ctx.fillText(pctText, 56, 290);
@@ -195,7 +216,7 @@ export async function renderExitCard(p: ExitCardParams): Promise<Buffer> {
   ];
   drawStatGrid(ctx, stats, 460);
 
-  ctx.font = '20px sans-serif';
+  ctx.font = font(20);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText(`Held ${p.heldMinutes} minutes`, 56, HEIGHT - 56);
 
@@ -223,15 +244,15 @@ export async function renderMilestoneCard(p: MilestoneCardParams): Promise<Buffe
 
   await drawTokenLogo(ctx, p.logoUrl, p.ticker, 130, 200, 64, accent);
 
-  ctx.font = 'bold 56px sans-serif';
+  ctx.font = font(56);
   ctx.fillStyle = TEXT_PRIMARY;
   ctx.fillText(`$${p.ticker}`, 220, 165);
 
-  ctx.font = '22px sans-serif';
+  ctx.font = font(22);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText(`${p.pnlPct >= 0 ? '+' : ''}${p.pnlPct.toFixed(1)}% from alert`, 220, 225);
 
-  ctx.font = 'bold 150px sans-serif';
+  ctx.font = font(150);
   ctx.fillStyle = accent;
   ctx.fillText(`${p.multiple.toFixed(1)}X`, 56, 300);
 
@@ -244,13 +265,16 @@ export async function renderMilestoneCard(p: MilestoneCardParams): Promise<Buffe
   return canvas.toBuffer('image/png');
 }
 
-// ── Card 3: Recap card (daily / weekly / monthly) — hero stat + mini list ──
+// ── Card 3: Recap card (daily / weekly / monthly) — hero winner, gainers
+// list, AND a losses list. Showing only winners would be misleading —
+// this is meant to be an honest performance snapshot. ──
 export interface RecapCardParams {
   botName: string;
   periodTitle: string;
   heroTicker: string;
   heroMultiple: number;
-  list: { ticker: string; multiple: number }[];
+  gainers: { ticker: string; multiple: number }[];
+  losses: { ticker: string; lossPct: number }[];
   statsLine?: string;
 }
 
@@ -262,40 +286,64 @@ export async function renderRecapCard(p: RecapCardParams): Promise<Buffer> {
   drawBackground(ctx, accent);
   drawHeader(ctx, p.botName, p.periodTitle.toUpperCase(), accent);
 
-  // Hero stat
-  ctx.font = '24px sans-serif';
+  // Hero stat, left
+  ctx.font = font(24);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText('BIGGEST WINNER', 56, 150);
 
-  ctx.font = 'bold 64px sans-serif';
+  ctx.font = font(60);
   ctx.fillStyle = TEXT_PRIMARY;
   ctx.fillText(`$${p.heroTicker}`, 56, 185);
 
-  ctx.font = 'bold 100px sans-serif';
+  ctx.font = font(90);
   ctx.fillStyle = accent;
-  ctx.fillText(`${p.heroMultiple.toFixed(1)}X`, 56, 260);
+  ctx.fillText(`${p.heroMultiple.toFixed(1)}X`, 56, 250);
 
-  // Mini list, right side
+  // Gainers list, top right
   const listX = 640;
   let listY = 150;
-  ctx.font = '22px sans-serif';
+  ctx.font = font(20);
   ctx.fillStyle = TEXT_MUTED;
-  ctx.fillText('TOP CALLS', listX, listY);
-  listY += 44;
+  ctx.fillText('TOP GAINERS', listX, listY);
+  listY += 40;
 
-  p.list.slice(0, 5).forEach((item, i) => {
-    ctx.font = 'bold 28px sans-serif';
+  p.gainers.slice(0, 3).forEach((item, i) => {
+    ctx.font = font(26);
     ctx.fillStyle = TEXT_PRIMARY;
     ctx.fillText(`${i + 1}. $${item.ticker}`, listX, listY);
     ctx.fillStyle = GREEN;
     ctx.textAlign = 'right';
     ctx.fillText(`${item.multiple.toFixed(1)}x`, WIDTH - 56, listY);
     ctx.textAlign = 'left';
-    listY += 46;
+    listY += 42;
   });
 
+  // Losses list, bottom right — same treatment as gainers, no hiding it
+  listY += 20;
+  ctx.font = font(20);
+  ctx.fillStyle = TEXT_MUTED;
+  ctx.fillText('STOP LOSSES', listX, listY);
+  listY += 40;
+
+  if (p.losses.length === 0) {
+    ctx.font = font(24);
+    ctx.fillStyle = TEXT_MUTED;
+    ctx.fillText('None this period', listX, listY);
+  } else {
+    p.losses.slice(0, 3).forEach((item, i) => {
+      ctx.font = font(26);
+      ctx.fillStyle = TEXT_PRIMARY;
+      ctx.fillText(`${i + 1}. $${item.ticker}`, listX, listY);
+      ctx.fillStyle = RED;
+      ctx.textAlign = 'right';
+      ctx.fillText(`${item.lossPct.toFixed(1)}%`, WIDTH - 56, listY);
+      ctx.textAlign = 'left';
+      listY += 42;
+    });
+  }
+
   if (p.statsLine) {
-    ctx.font = '24px sans-serif';
+    ctx.font = font(24);
     ctx.fillStyle = TEXT_MUTED;
     ctx.fillText(p.statsLine, 56, HEIGHT - 70);
   }
