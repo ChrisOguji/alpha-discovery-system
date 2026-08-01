@@ -67,6 +67,25 @@ async function getSolUsd(): Promise<number> {
   }
   return cachedSolUsd;
 }
+
+// ── Token logo, pulled from DexScreener — cached per address for an hour
+// since a token's image doesn't change often, and this avoids a repeat
+// lookup every time the same token gets a card generated. ──
+const logoCache = new Map<string, { url: string | undefined; cachedAt: number }>();
+const LOGO_CACHE_TTL_MS = 60 * 60 * 1000;
+async function getTokenLogoUrl(address: string): Promise<string | undefined> {
+  const cached = logoCache.get(address);
+  if (cached && Date.now() - cached.cachedAt < LOGO_CACHE_TTL_MS) return cached.url;
+  try {
+    const { data } = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 5000 });
+    const url = data?.pairs?.[0]?.info?.imageUrl || undefined;
+    logoCache.set(address, { url, cachedAt: Date.now() });
+    return url;
+  } catch {
+    logoCache.set(address, { url: undefined, cachedAt: Date.now() });
+    return undefined;
+  }
+}
 const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL || 'https://alpha-discovery-system.onrender.com';
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
@@ -488,6 +507,7 @@ async function monitorPositions() {
               }
 
               try {
+                const logoUrl = await getTokenLogoUrl(address);
                 const card = await renderMilestoneCard({
                   botName: DENGINE_NAME,
                   ticker: rec.ticker,
@@ -495,6 +515,7 @@ async function monitorPositions() {
                   alertMcap: rec.alertMcap,
                   peakMcap: updated.peakMcap,
                   pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
+                  logoUrl,
                 });
                 await bot.telegram.sendPhoto(CHAT_ID, { source: card });
                 console.log(`📢 Milestone (card): ${rec.ticker} hit ${multiple}x`);
@@ -525,6 +546,7 @@ async function monitorPositions() {
           const solUsd = await getSolUsd();
           const rec = alertHistory.get(address);
           try {
+            const logoUrl = await getTokenLogoUrl(address);
             const card = await renderExitCard({
               type: 'TP',
               botName: DENGINE_NAME,
@@ -538,6 +560,7 @@ async function monitorPositions() {
               entryMcap: rec?.alertMcap || 0,
               exitMcap: currentMcap,
               heldMinutes: holdingMins,
+              logoUrl,
             });
             await bot.telegram.sendPhoto(CHAT_ID, { source: card });
           } catch (e: any) {
@@ -585,6 +608,7 @@ async function monitorPositions() {
           if (!everPumped) {
             try {
               const solUsd = await getSolUsd();
+              const logoUrl = await getTokenLogoUrl(address);
               const card = await renderExitCard({
                 type: 'SL',
                 botName: DENGINE_NAME,
@@ -598,6 +622,7 @@ async function monitorPositions() {
                 entryMcap: rec?.alertMcap || 0,
                 exitMcap: currentMcap,
                 heldMinutes: holdingMins,
+                logoUrl,
               });
               await bot.telegram.sendPhoto(CHAT_ID, { source: card });
             } catch (e: any) {
@@ -635,7 +660,7 @@ async function postTopGainers(windowMs: number, title: string): Promise<void> {
   const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
   if (inWindow.length === 0) return;
 
-  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
+  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
   const hero = ranked[0];
 
   try {
@@ -645,7 +670,6 @@ async function postTopGainers(windowMs: number, title: string): Promise<void> {
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
-      losses: [],
       statsLine: `${inWindow.length} calls in this window`,
     });
     await bot.telegram.sendPhoto(CHAT_ID, { source: card });
@@ -660,19 +684,14 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
   const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
   if (inWindow.length === 0) return;
 
-  const wins = inWindow.filter(r => r.peakPrice > r.alertPrice).length;
-  const slExits = inWindow.filter(r => r.exitReason === 'SL' && r.exitPrice != null);
-  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 5);
+  // ── Winner: peaked at +40% or more. Loser: never got above +30%.
+  // Anything in between (30-40%) counts as neither. ──
+  const wins = inWindow.filter(r => gainMultiple(r) >= 1.4).length;
+  const losses = inWindow.filter(r => gainMultiple(r) < 1.3).length;
+
+  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
   const hero = gainersRanked[0];
   if (!hero) return;
-
-  // ── Real losses — based on actual exit price vs alert price, not peak
-  // (peak can never be below alert price, so it can't show a loss) ──
-  const lossesRanked = slExits
-    .map(r => ({ ticker: r.ticker, lossPct: ((r.exitPrice! - r.alertPrice) / r.alertPrice) * 100 }))
-    .filter(l => l.lossPct < 0)
-    .sort((a, b) => a.lossPct - b.lossPct)
-    .slice(0, 3);
 
   try {
     const card = await renderRecapCard({
@@ -681,8 +700,7 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: gainersRanked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
-      losses: lossesRanked,
-      statsLine: `${inWindow.length} calls · ${wins} wins · ${slExits.length} losses`,
+      statsLine: `${inWindow.length} calls · ${wins} wins · ${losses} losses`,
     });
     await bot.telegram.sendPhoto(CHAT_ID, { source: card });
     console.log(`📢 Posted ${periodTitle}`);
@@ -1361,6 +1379,7 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
   if (rec && rec.alertPrice > 0) {
     const peakPct = ((rec.peakPrice - rec.alertPrice) / rec.alertPrice) * 100;
     try {
+      const logoUrl = await getTokenLogoUrl(address);
       const card = await renderCallResultCard({
         botName: DENGINE_NAME,
         ticker: rec.ticker,
@@ -1369,6 +1388,7 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
         peakPct,
         multiple: rec.peakPrice / rec.alertPrice,
         neverPumped: peakPct < 30,
+        logoUrl,
       });
       await bot.telegram.sendPhoto(ctx.chat!.id, { source: card });
     } catch (e: any) {
