@@ -8,6 +8,7 @@
     "start": "tsc && node dist/bot.js"
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.53",
     "viem": "^2.21.0",
     "@solana/web3.js": "^1.95.5",
     "axios": "^1.7.2",

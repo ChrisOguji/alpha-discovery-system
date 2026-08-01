@@ -1,7 +1,7 @@
 import { TokenSignal } from './types';
 
 export class CapitalRiskEngine {
-  private MAX_SOL_ALLOCATION_PER_TRADE = 0.15;
+  private MAX_SOL_ALLOCATION_PER_TRADE = 0.07;
   private MAX_PORTFOLIO_EXPOSURE_SOL = 5.0;
   private GLOBAL_KILL_SWITCH = false;
 

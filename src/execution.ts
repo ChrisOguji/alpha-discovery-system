@@ -390,10 +390,15 @@ export class LowLatencyExecutionEngine {
     signature: string
   ): Promise<{ success: boolean; signature?: string; error?: string } | null> {
     try {
-      const TIP_LAMPORTS = Math.floor(0.001 * LAMPORTS_PER_SOL);
-      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, tx.message.recentBlockhash);
+      // ── Tip bumped from 0.001 to 0.003 SOL — too-low tips get skipped by
+      // validators, especially during busy periods ──
+      const TIP_LAMPORTS = Math.floor(0.003 * LAMPORTS_PER_SOL);
 
-      const tipEncoded = Buffer.from(tipTx.serialize()).toString('base64');
+      const swapBlockhash = tx.message.recentBlockhash;
+      console.log('🎯 Building Jito tip transaction...');
+      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, swapBlockhash);
+
+      const tipEncoded  = Buffer.from(tipTx.serialize()).toString('base64');
       const swapEncoded = Buffer.from(tx.serialize()).toString('base64');
 
       const res = await this.client.post(
@@ -402,24 +407,34 @@ export class LowLatencyExecutionEngine {
           jsonrpc: '2.0',
           id: 1,
           method: 'sendBundle',
-          // Jito's sendBundle expects base58 unless the encoding is declared explicitly.
-          params: [[tipEncoded, swapEncoded], { encoding: 'base64' }]
+          params: [
+            [tipEncoded, swapEncoded],
+            { encoding: 'base64' }
+          ]
         },
         { timeout: 10000 }
       );
 
       if (res.data?.result) {
-        console.log(`📦 Jito bundle sent: ${res.data.result} (tx ${signature})`);
-        const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
-          if (confirmed) console.log(`✅ Tx confirmed on-chain via Jito bundle: ${signature}`);
-          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
-        });
-        return { success: true, signature };
+        const bundleId = res.data.result;
+        console.log(`📦 Jito bundle sent: ${bundleId}`);
+
+        // ── Actually wait for confirmation before reporting success — a
+        // bundle Jito accepted into queue but never landed is not a real trade ──
+        const confirmed = await this.confirmJitoBundle(bundleId);
+        if (confirmed) {
+          console.log(`✅ Jito bundle confirmed: ${bundleId}`);
+          return { success: true, bundleId };
+        }
+
+        console.log(`⚠️ Jito bundle unconfirmed after 30s, falling back to direct RPC: ${bundleId}`);
+        return this.fallbackToQuickNode(tx.serialize());
       }
 
-      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${res.data?.error?.message || 'Jito rejected bundle'}`);
-      return null;
+      const jitoError = res.data?.error?.message || 'Jito rejected bundle';
+      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${jitoError}`);
+      return this.fallbackToQuickNode(tx.serialize());
+
     } catch (e: any) {
       const status = e.response?.status;
       const body = e.response?.data;
@@ -427,17 +442,36 @@ export class LowLatencyExecutionEngine {
         `⚠️ Jito bundle failed${status ? ` (HTTP ${status})` : ''}, falling back to direct RPC: ` +
         `${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
       );
-      return null;
+      return this.fallbackToQuickNode(tx.serialize());
     }
   }
 
-  // ✅ Send the Jupiter-built swap tx directly via RPC — returns signature immediately,
-  // confirms in background. This is the same path used regardless of whether Jito was
-  // attempted first, so a Jito outage never changes how a regular trade executes.
-  private async sendViaRpc(
-    tx: VersionedTransaction,
-    signature: string
-  ): Promise<{ success: boolean; signature?: string; error?: string }> {
+  // ✅ Jito bundle confirmation — polls every 5s for up to 30 seconds
+  private async confirmJitoBundle(bundleId: string): Promise<boolean> {
+    for (let i = 0; i < 6; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      try {
+        const res = await this.client.post(
+          'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
+          {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getBundleStatuses",
+            params: [[bundleId]]
+          },
+          { timeout: 8000 }
+        );
+        const status = res.data?.result?.value?.[0]?.confirmation_status;
+        if (status === 'confirmed' || status === 'finalized') return true;
+      } catch {
+        // keep polling
+      }
+    }
+    return false;
+  }
+  
+  // ✅ Direct RPC — now waits for actual on-chain confirmation before reporting success
+  private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
       if (!rpcUrl) return { success: false, error: 'No RPC URL available' };
@@ -458,13 +492,14 @@ export class LowLatencyExecutionEngine {
         console.log(`📝 Tx signature: ${signature}`);
         console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
 
-        // ✅ Confirm in background — scan continues immediately
-        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
-          if (confirmed) console.log(`✅ Tx confirmed on-chain: ${signature}`);
-          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
-        });
+        const confirmed = await this.confirmTransaction(signature, rpcUrl);
+        if (confirmed) {
+          console.log(`✅ Tx confirmed on-chain: ${signature}`);
+          return { success: true, bundleId: signature };
+        }
 
-        return { success: true, signature };
+        console.log(`⚠️ Tx not confirmed after 50s — treating as failed: https://solscan.io/tx/${signature}`);
+        return { success: false, error: 'Transaction not confirmed on-chain within 50s' };
       }
 
       return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
@@ -477,7 +512,7 @@ export class LowLatencyExecutionEngine {
       return { success: false, error: 'RPC network failure' };
     }
   }
-
+  
   // ✅ Background confirmation — 20 attempts over 50 seconds
   private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
     for (let i = 0; i < 20; i++) {
