@@ -90,7 +90,7 @@ const DOMAIN = process.env.RAILWAY_STATIC_URL || process.env.RENDER_EXTERNAL_URL
 const seenTokens = new Set<string>();
 const seenTokensQueue: string[] = [];
 const wssPumpTokensQueue: any[] = [];
-type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl' | 'delayedEntryMcap';
+type AwaitingType = 'privateKey' | 'tradeSize' | 'tp' | 'sl' | 'delayedEntryMcap' | 'slippage';
 const awaitingInput = new Map<string, AwaitingType>();
 const awaitingTimers = new Map<string, NodeJS.Timeout>();
 const AWAITING_TIMEOUT_MS = 5 * 60 * 1000;
@@ -443,9 +443,9 @@ async function monitorPositions() {
         if (executor.hasWallet()) {
           try {
             const tradeSol = botSettings.tradeSizeSol;
-            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
+            const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY', botSettings.slippageBps);
             tx.sign([executor.getWalletKeypair()]);
-            const result = await executor.dispatchMevProtectedBundle(tx);
+            const result = await executor.executeSwap(tx);
             if (result.success && currentPrice > 0) {
               openPositions.set(address, {
                 ticker: pending.ticker, address,
@@ -457,7 +457,7 @@ async function monitorPositions() {
                 stopLossPct: -35,
                 remainingPct: 100,
               });
-              const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
+              const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
               await bot.telegram.sendMessage(CHAT_ID, [
                 `⏳➡️✅ *DELAYED ENTRY EXECUTED*`, ``,
                 `*Token:* $${escapeText(pending.ticker)}`,
@@ -929,11 +929,11 @@ async function scan() {
           } else {
             try {
               const tradeSol = botSettings.tradeSizeSol;
-              const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY');
+              const tx = await executor.buildJupiterSwapTransaction(address, tradeSol, 'BUY', botSettings.slippageBps);
               tx.sign([executor.getWalletKeypair()]);
-              const result = await executor.dispatchMevProtectedBundle(tx);
+              const result = await executor.executeSwap(tx);
               if (result.success) {
-                const txLink = result.bundleId ? ` — [Solscan](https://solscan.io/tx/${result.bundleId})` : '';
+                const txLink = result.signature ? ` — [Solscan](https://solscan.io/tx/${result.signature})` : '';
                 executionState = `✅ Auto\\-Buy Executed${txLink}`;
                 executedSizeSol = tradeSol;
                 executedPrice = currentPrice;
@@ -1497,6 +1497,7 @@ async function buildSettingsMessage() {
     `🛑 *Stop Loss:* \\-${botSettings.stopLossPct}%`,
     `⏳ *Delayed Entry:* ${botSettings.delayedEntryEnabled ? '✅ ON' : '❌ OFF'} — buy held until $${botSettings.delayedEntryMcap.toLocaleString('en-US')} MCAP`,
     `🪙 *Robinhood:* ${botSettings.robinhoodEnabled ? '✅ ON' : '❌ OFF'} — launchpad scans and listeners are ${botSettings.robinhoodEnabled ? 'active' : 'disabled'}`,
+    `📉 *Slippage Tolerance:* ${(botSettings.slippageBps / 100).toFixed(1)}% — tighter reduces sandwich exposure, wider reduces failed trades`,
   ].join('\n');
 
   const keyboard = Markup.inlineKeyboard([
@@ -1504,6 +1505,7 @@ async function buildSettingsMessage() {
     [Markup.button.callback('💰 Set Trade Size (SOL)', 'set_trade_size')],
     [Markup.button.callback('🎯 Set Take Profit %', 'set_tp')],
     [Markup.button.callback('🛑 Set Stop Loss %', 'set_sl')],
+    [Markup.button.callback('📉 Set Slippage %', 'set_slippage')],
     [Markup.button.callback(
       botSettings.delayedEntryEnabled ? '⏳ Delayed Entry: ON (tap to disable)' : '⏳ Delayed Entry: OFF (tap to enable)',
       'toggle_delayed_entry'
@@ -1586,6 +1588,15 @@ bot.action('set_sl', async (ctx) => {
   );
 });
 
+bot.action('set_slippage', async (ctx) => {
+  await ctx.answerCbQuery();
+  setAwaiting(ctx.chat!.id.toString(), 'slippage');
+  await ctx.reply(
+    `📉 *Enter slippage tolerance as a percentage*\n\nExample: \`5\` allows up to 5% price movement before the trade is rejected \\(tighter = less MEV/sandwich exposure, but more failed trades on fast\\-moving tokens\\)\n\nCurrent: *${(botSettings.slippageBps / 100).toFixed(1)}%*`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 bot.action('set_delayed_entry_mcap', async (ctx) => {
   await ctx.answerCbQuery();
   setAwaiting(ctx.chat!.id.toString(), 'delayedEntryMcap');
@@ -1662,6 +1673,15 @@ bot.on('text', async (ctx) => {
     botSettings.delayedEntryMcap = value;
     await saveSetting(chatId, 'delayedEntryMcap', value);
     await ctx.reply(`✅ *Delayed entry MCAP set to $${value.toLocaleString('en-US')}*`, { parse_mode: 'Markdown' });
+  } else if (waiting === 'slippage') {
+    if (value > 50) {
+      await ctx.reply(`❌ Slippage capped at 50% for safety\\.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    const bps = Math.round(value * 100);
+    botSettings.slippageBps = bps;
+    await saveSetting(chatId, 'slippageBps', bps);
+    await ctx.reply(`✅ *Slippage tolerance set to ${value}%*`, { parse_mode: 'Markdown' });
   }
 });
 
