@@ -12,7 +12,8 @@ import {
 import bs58 from 'bs58';
 import * as https from 'https';
 
-// ── Official Jito tip accounts ──
+// ── Official Jito tip accounts — used only as a first-attempt private-bundle path;
+// every trade still has a regular-RPC fallback that is untouched by this ──
 const JITO_TIP_ACCOUNTS = [
   '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
   'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
@@ -42,6 +43,9 @@ export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
   private jitoBundleEndpoint = 'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles';
   private wallet: Keypair | null = null;
+
+  // ── Trade protection: abort rather than execute into a thin/manipulated pool ──
+  private readonly MAX_PRICE_IMPACT_PCT = 15;
 
   private client = axios.create({
     httpsAgent: new https.Agent({ family: 4 }),
@@ -297,7 +301,12 @@ export class LowLatencyExecutionEngine {
     return VersionedTransaction.deserialize(serialized);
   }
 
-  public async buildJupiterSwapTransaction(outputMint: string, solAmount: number, direction: 'BUY' | 'SELL'): Promise<VersionedTransaction> {
+  public async buildJupiterSwapTransaction(
+    outputMint: string,
+    solAmount: number,
+    direction: 'BUY' | 'SELL',
+    slippageBps: number
+  ): Promise<VersionedTransaction> {
     if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
     const wsolMint = 'So11111111111111111111111111111111111111112';
     const inputMint = direction === 'BUY' ? wsolMint : outputMint;
@@ -309,12 +318,21 @@ export class LowLatencyExecutionEngine {
         inputMint,
         outputMint: targetOutputMint,
         amount: computedUnits,
-        slippageBps: 2000,
+        slippageBps,
         onlyDirectRoutes: false,
         dynamicSlippage: true
       },
       timeout: 8000
     });
+
+    // ── Trade protection: refuse to route into a pool so thin the trade itself moves
+    // the price past our tolerance — this is the classic setup for a sandwich attack ──
+    const priceImpactPct = parseFloat(quoteRes.data?.priceImpactPct || '0') * 100;
+    if (priceImpactPct > this.MAX_PRICE_IMPACT_PCT) {
+      throw new Error(
+        `Price impact too high: ${priceImpactPct.toFixed(2)}% (max ${this.MAX_PRICE_IMPACT_PCT}%) — thin liquidity, aborting trade`
+      );
+    }
 
     const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
@@ -332,10 +350,9 @@ export class LowLatencyExecutionEngine {
     return VersionedTransaction.deserialize(swapBuffer);
   }
 
-  // ── Build a legacy tip transaction to one random Jito tip account ──
-  // ── Uses the same blockhash as the swap tx to satisfy Jito bundle requirements ──
+  // ── Build a small tip transfer to a random Jito tip account, sharing the swap tx's
+  // blockhash so both can land as one atomic bundle ──
   private buildJitoTipTransaction(tipLamports: number, blockhash: string): Transaction {
-    // Pick a random tip account to distribute load
     const tipAccount = new PublicKey(
       JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
     );
@@ -355,107 +372,82 @@ export class LowLatencyExecutionEngine {
     return tipTx;
   }
 
-  public async dispatchMevProtectedBundle(tx: VersionedTransaction): Promise<{ success: boolean; bundleId?: string; error?: string }> {
+  // ✅ Try landing the swap privately via a Jito bundle first — bundles are atomic, so if
+  // Jito doesn't accept/land it, nothing executes and nothing is spent, meaning the plain
+  // RPC fallback below always sees a fresh, unspent, still-valid signed tx. That fallback
+  // is untouched from before this was added — this is a pure first-attempt on top.
+  public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
+    const signature = bs58.encode(tx.signatures[0]);
+
+    const jitoResult = await this.trySendViaJitoBundle(tx, signature);
+    if (jitoResult) return jitoResult;
+
+    return this.sendViaRpc(tx, signature);
+  }
+
+  private async trySendViaJitoBundle(
+    tx: VersionedTransaction,
+    signature: string
+  ): Promise<{ success: boolean; signature?: string; error?: string } | null> {
     try {
-      // ── Tip amount: 0.001 SOL ──
       const TIP_LAMPORTS = Math.floor(0.001 * LAMPORTS_PER_SOL);
+      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, tx.message.recentBlockhash);
 
-      // ── Extract blockhash from swap tx so both txs share the same one ──
-      const swapBlockhash = tx.message.recentBlockhash;
-      console.log('🎯 Building Jito tip transaction...');
-      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, swapBlockhash);
-
-      // ── Encode both transactions: tip first, swap second ──
-      const tipEncoded  = Buffer.from(tipTx.serialize()).toString('base64');
+      const tipEncoded = Buffer.from(tipTx.serialize()).toString('base64');
       const swapEncoded = Buffer.from(tx.serialize()).toString('base64');
 
-      console.log('📤 Sending Jito bundle (tip + swap)...');
       const res = await this.client.post(
         this.jitoBundleEndpoint,
         {
           jsonrpc: '2.0',
           id: 1,
           method: 'sendBundle',
-          // ── FIX: Jito's sendBundle defaults to expecting base58-encoded
-          // transactions. We're sending base64, so we must declare the
-          // encoding explicitly in the params config object, or Jito will
-          // fail to decode the payload and return HTTP 400.
-          params: [
-            [tipEncoded, swapEncoded],
-            { encoding: 'base64' }
-          ]
+          // Jito's sendBundle expects base58 unless the encoding is declared explicitly.
+          params: [[tipEncoded, swapEncoded], { encoding: 'base64' }]
         },
         { timeout: 10000 }
       );
 
       if (res.data?.result) {
-        const bundleId = res.data.result;
-        console.log(`📦 Jito bundle sent: ${bundleId}`);
-
-        // ── Confirm bundle in background — scan continues immediately ──
-        this.confirmJitoBundle(bundleId).then(confirmed => {
-          if (confirmed) console.log(`✅ Jito bundle confirmed: ${bundleId}`);
-          else console.log(`⚠️ Jito bundle unconfirmed after 30s — check manually: ${bundleId}`);
+        console.log(`📦 Jito bundle sent: ${res.data.result} (tx ${signature})`);
+        const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
+        this.confirmTransaction(signature, rpcUrl).then(confirmed => {
+          if (confirmed) console.log(`✅ Tx confirmed on-chain via Jito bundle: ${signature}`);
+          else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
         });
-
-        return { success: true, bundleId };
+        return { success: true, signature };
       }
 
-      // ── Jito rejected — fall back to direct RPC ──
-      const jitoError = res.data?.error?.message || 'Jito rejected bundle';
-      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${jitoError}`);
-      return this.fallbackToQuickNode(tx.serialize());
-
+      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${res.data?.error?.message || 'Jito rejected bundle'}`);
+      return null;
     } catch (e: any) {
-      // ── FIX: log the actual response body from Jito (not just e.message),
-      // since axios error messages for 4xx/5xx responses don't include the
-      // server's error payload by default. This is what actually tells you
-      // *why* Jito returned 400 (bad encoding, malformed tx, etc.) instead
-      // of just "unreachable", which was misleading — the request reached
-      // Jito fine, it was rejected.
       const status = e.response?.status;
       const body = e.response?.data;
       console.log(
-        `⚠️ Jito request failed${status ? ` (HTTP ${status})` : ''}, falling back to direct RPC: ` +
+        `⚠️ Jito bundle failed${status ? ` (HTTP ${status})` : ''}, falling back to direct RPC: ` +
         `${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
       );
-      return this.fallbackToQuickNode(tx.serialize());
+      return null;
     }
   }
 
-  // ✅ Jito bundle confirmation — kept for future use if Jito tip is added
-  private async confirmJitoBundle(bundleId: string): Promise<boolean> {
-    try {
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      const res = await this.client.post(
-        'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
-        {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getBundleStatuses",
-          params: [[bundleId]]
-        },
-        { timeout: 8000 }
-      );
-      const status = res.data?.result?.value?.[0]?.confirmation_status;
-      return status === 'confirmed' || status === 'finalized';
-    } catch {
-      return false;
-    }
-  }
-
-  // ✅ Direct RPC — returns signature immediately, confirms in background
-  private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
+  // ✅ Send the Jupiter-built swap tx directly via RPC — returns signature immediately,
+  // confirms in background. This is the same path used regardless of whether Jito was
+  // attempted first, so a Jito outage never changes how a regular trade executes.
+  private async sendViaRpc(
+    tx: VersionedTransaction,
+    signature: string
+  ): Promise<{ success: boolean; signature?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
-      if (!rpcUrl) return { success: false, error: 'No RPC URL available for fallback' };
+      if (!rpcUrl) return { success: false, error: 'No RPC URL available' };
 
       const payload = {
         jsonrpc: "2.0",
         id: 1,
         method: "sendTransaction",
         params: [
-          Buffer.from(serializedTx).toString('base64'),
+          Buffer.from(tx.serialize()).toString('base64'),
           { encoding: "base64", maxRetries: 3, skipPreflight: true }
         ]
       };
@@ -463,7 +455,6 @@ export class LowLatencyExecutionEngine {
       const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
 
       if (res.data?.result) {
-        const signature = res.data.result;
         console.log(`📝 Tx signature: ${signature}`);
         console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
 
@@ -473,12 +464,17 @@ export class LowLatencyExecutionEngine {
           else console.log(`⚠️ Tx not confirmed after 50s — check manually: https://solscan.io/tx/${signature}`);
         });
 
-        return { success: true, bundleId: signature };
+        return { success: true, signature };
       }
 
       return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
     } catch (e: any) {
-      return { success: false, error: 'Fallback RPC network failure' };
+      const status = e.response?.status;
+      const body = e.response?.data;
+      console.log(
+        `⚠️ Swap send failed${status ? ` (HTTP ${status})` : ''}: ${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
+      );
+      return { success: false, error: 'RPC network failure' };
     }
   }
 

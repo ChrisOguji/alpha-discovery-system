@@ -106,12 +106,14 @@ export async function initDatabaseSchema() {
         delayed_entry_enabled BOOLEAN DEFAULT FALSE,
         delayed_entry_mcap NUMERIC DEFAULT 15000,
         robinhood_enabled BOOLEAN DEFAULT TRUE,
+        slippage_bps NUMERIC DEFAULT 1000,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS delayed_entry_enabled BOOLEAN DEFAULT FALSE`);
     await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS delayed_entry_mcap NUMERIC DEFAULT 15000`);
     await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS robinhood_enabled BOOLEAN DEFAULT TRUE`);
+    await db.query(`ALTER TABLE bot_settings ADD COLUMN IF NOT EXISTS slippage_bps NUMERIC DEFAULT 1000`);
 
     console.log("⚡ Supabase Tables & High-Performance Schema Verified.");
   } catch (err) {
