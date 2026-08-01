@@ -2,7 +2,6 @@ import axios from 'axios';
 import {
   VersionedTransaction,
   Keypair,
-  SystemProgram,
   PublicKey,
   Transaction,
   LAMPORTS_PER_SOL,
@@ -11,19 +10,6 @@ import {
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import * as https from 'https';
-
-// ── Official Jito tip accounts — used only as a first-attempt private-bundle path;
-// every trade still has a regular-RPC fallback that is untouched by this ──
-const JITO_TIP_ACCOUNTS = [
-  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
-  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
-  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
-  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
-  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
-  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
-  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
-  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
-];
 
 // ── pump.fun program constants ──
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -41,7 +27,6 @@ const SELL_DISCRIMINATOR = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
 
 export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
-  private jitoBundleEndpoint = 'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles';
   private wallet: Keypair | null = null;
 
   // ── Trade protection: abort rather than execute into a thin/manipulated pool ──
@@ -350,128 +335,88 @@ export class LowLatencyExecutionEngine {
     return VersionedTransaction.deserialize(swapBuffer);
   }
 
-  // ── Build a small tip transfer to a random Jito tip account, sharing the swap tx's
-  // blockhash so both can land as one atomic bundle ──
-  private buildJitoTipTransaction(tipLamports: number, blockhash: string): Transaction {
-    const tipAccount = new PublicKey(
-      JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
-    );
-
-    const tipTx = new Transaction();
-    tipTx.recentBlockhash = blockhash;
-    tipTx.feePayer = this.wallet!.publicKey;
-    tipTx.add(
-      SystemProgram.transfer({
-        fromPubkey: this.wallet!.publicKey,
-        toPubkey: tipAccount,
-        lamports: tipLamports,
-      })
-    );
-
-    tipTx.sign(this.wallet!);
-    return tipTx;
-  }
-
-  // ✅ Try landing the swap privately via a Jito bundle first — bundles are atomic, so if
-  // Jito doesn't accept/land it, nothing executes and nothing is spent, meaning the plain
-  // RPC fallback below always sees a fresh, unspent, still-valid signed tx. That fallback
-  // is untouched from before this was added — this is a pure first-attempt on top.
-  public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
-    const signature = bs58.encode(tx.signatures[0]);
-
-    const jitoResult = await this.trySendViaJitoBundle(tx, signature);
-    if (jitoResult) return jitoResult;
-
-    return this.sendViaRpc(tx, signature);
-  }
-
-  private async trySendViaJitoBundle(
-    tx: VersionedTransaction,
-    signature: string
-  ): Promise<{ success: boolean; signature?: string; error?: string } | null> {
+  // ── Read the wallet's actual held balance + decimals for a token. Needed
+  // because Jupiter's quote API wants the raw amount in the token's own
+  // decimals, which varies per token — not the fixed 9 decimals SOL uses. ──
+  public async getTokenBalance(mintAddress: string): Promise<{ rawAmount: bigint; decimals: number } | null> {
+    if (!this.wallet) return null;
     try {
-      // ── Tip bumped from 0.001 to 0.003 SOL — too-low tips get skipped by
-      // validators, especially during busy periods ──
-      const TIP_LAMPORTS = Math.floor(0.003 * LAMPORTS_PER_SOL);
+      const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
+      const res = await this.client.post(rpcUrl, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'getTokenAccountsByOwner',
+        params: [
+          this.wallet.publicKey.toBase58(),
+          { mint: mintAddress },
+          { encoding: 'jsonParsed' }
+        ]
+      }, { timeout: 8000 });
 
-      const swapBlockhash = tx.message.recentBlockhash;
-      console.log('🎯 Building Jito tip transaction...');
-      const tipTx = this.buildJitoTipTransaction(TIP_LAMPORTS, swapBlockhash);
+      const account = res.data?.result?.value?.[0];
+      if (!account) return null;
+      const info = account.account?.data?.parsed?.info?.tokenAmount;
+      if (!info) return null;
+      return { rawAmount: BigInt(info.amount), decimals: info.decimals };
+    } catch {
+      return null;
+    }
+  }
 
-      const tipEncoded  = Buffer.from(tipTx.serialize()).toString('base64');
-      const swapEncoded = Buffer.from(tx.serialize()).toString('base64');
+  // ── Sell the wallet's full held balance of a token via Jupiter. This is
+  // the method TP/SL exits should call — it reads the real on-chain balance
+  // first rather than assuming an amount, so it always sells exactly what's
+  // actually held, correctly scaled for that token's real decimals. ──
+  public async buildJupiterSellTransaction(mint: string, slippageBps: number): Promise<VersionedTransaction> {
+    if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
 
-      const res = await this.client.post(
-        this.jitoBundleEndpoint,
-        {
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'sendBundle',
-          params: [
-            [tipEncoded, swapEncoded],
-            { encoding: 'base64' }
-          ]
-        },
-        { timeout: 10000 }
+    const balance = await this.getTokenBalance(mint);
+    if (!balance || balance.rawAmount === 0n) {
+      throw new Error('No token balance found in wallet to sell');
+    }
+
+    const wsolMint = 'So11111111111111111111111111111111111111112';
+
+    const quoteRes = await this.client.get(`${this.jupiterUrl}/quote`, {
+      params: {
+        inputMint: mint,
+        outputMint: wsolMint,
+        amount: balance.rawAmount.toString(),
+        slippageBps,
+        onlyDirectRoutes: false,
+        dynamicSlippage: true
+      },
+      timeout: 8000
+    });
+
+    // ── Same thin-liquidity protection as the buy side ──
+    const priceImpactPct = parseFloat(quoteRes.data?.priceImpactPct || '0') * 100;
+    if (priceImpactPct > this.MAX_PRICE_IMPACT_PCT) {
+      throw new Error(
+        `Price impact too high: ${priceImpactPct.toFixed(2)}% (max ${this.MAX_PRICE_IMPACT_PCT}%) — thin liquidity, aborting sell`
       );
+    }
 
-      if (res.data?.result) {
-        const bundleId = res.data.result;
-        console.log(`📦 Jito bundle sent: ${bundleId}`);
-
-        // ── Actually wait for confirmation before reporting success — a
-        // bundle Jito accepted into queue but never landed is not a real trade ──
-        const confirmed = await this.confirmJitoBundle(bundleId);
-        if (confirmed) {
-          console.log(`✅ Jito bundle confirmed: ${bundleId}`);
-          return { success: true, bundleId };
+    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
+      quoteResponse: quoteRes.data,
+      userPublicKey: this.wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          maxLamports: 3000000,
+          priorityLevel: "veryHigh"
         }
-
-        console.log(`⚠️ Jito bundle unconfirmed after 30s, falling back to direct RPC: ${bundleId}`);
-        return this.fallbackToQuickNode(tx.serialize());
       }
+    }, { timeout: 8000 });
 
-      const jitoError = res.data?.error?.message || 'Jito rejected bundle';
-      console.log(`⚠️ Jito rejected, falling back to direct RPC: ${jitoError}`);
-      return this.fallbackToQuickNode(tx.serialize());
-
-    } catch (e: any) {
-      const status = e.response?.status;
-      const body = e.response?.data;
-      console.log(
-        `⚠️ Jito bundle failed${status ? ` (HTTP ${status})` : ''}, falling back to direct RPC: ` +
-        `${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
-      );
-      return this.fallbackToQuickNode(tx.serialize());
-    }
+    const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
+    return VersionedTransaction.deserialize(swapBuffer);
   }
 
-  // ✅ Jito bundle confirmation — polls every 5s for up to 30 seconds
-  private async confirmJitoBundle(bundleId: string): Promise<boolean> {
-    for (let i = 0; i < 6; i++) {
-      await new Promise(resolve => setTimeout(resolve, 5000));
-      try {
-        const res = await this.client.post(
-          'https://ny.mainnet.block-engine.jito.wtf/api/v1/getBundleStatuses',
-          {
-            jsonrpc: "2.0",
-            id: 1,
-            method: "getBundleStatuses",
-            params: [[bundleId]]
-          },
-          { timeout: 8000 }
-        );
-        const status = res.data?.result?.value?.[0]?.confirmation_status;
-        if (status === 'confirmed' || status === 'finalized') return true;
-      } catch {
-        // keep polling
-      }
-    }
-    return false;
-  }
-  
-  // ✅ Direct RPC — now waits for actual on-chain confirmation before reporting success
-  private async fallbackToQuickNode(serializedTx: Uint8Array): Promise<{ success: boolean; bundleId?: string; error?: string }> {
+  // ✅ Send straight via RPC and wait for real on-chain confirmation before
+  // reporting success — no Jito bundle involved, per request to simplify
+  // the execution path down to a single straightforward Jupiter/RPC flow.
+  public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
       if (!rpcUrl) return { success: false, error: 'No RPC URL available' };
@@ -489,16 +434,17 @@ export class LowLatencyExecutionEngine {
       const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
 
       if (res.data?.result) {
-        console.log(`📝 Tx signature: ${signature}`);
-        console.log(`🔍 Check: https://solscan.io/tx/${signature}`);
+        const signature = res.data.result;
+        console.log(`\ud83d\udcdd Tx signature: ${signature}`);
+        console.log(`\ud83d\udd0d Check: https://solscan.io/tx/${signature}`);
 
         const confirmed = await this.confirmTransaction(signature, rpcUrl);
         if (confirmed) {
-          console.log(`✅ Tx confirmed on-chain: ${signature}`);
-          return { success: true, bundleId: signature };
+          console.log(`\u2705 Tx confirmed on-chain: ${signature}`);
+          return { success: true, signature };
         }
 
-        console.log(`⚠️ Tx not confirmed after 50s — treating as failed: https://solscan.io/tx/${signature}`);
+        console.log(`\u26a0\ufe0f Tx not confirmed after 50s \u2014 treating as failed: https://solscan.io/tx/${signature}`);
         return { success: false, error: 'Transaction not confirmed on-chain within 50s' };
       }
 
@@ -507,13 +453,13 @@ export class LowLatencyExecutionEngine {
       const status = e.response?.status;
       const body = e.response?.data;
       console.log(
-        `⚠️ Swap send failed${status ? ` (HTTP ${status})` : ''}: ${e.message}${body ? ` — response: ${JSON.stringify(body)}` : ''}`
+        `\u26a0\ufe0f Swap send failed${status ? ` (HTTP ${status})` : ''}: ${e.message}${body ? ` \u2014 response: ${JSON.stringify(body)}` : ''}`
       );
       return { success: false, error: 'RPC network failure' };
     }
   }
-  
-  // ✅ Background confirmation — 20 attempts over 50 seconds
+
+  // \u2705 Background confirmation \u2014 20 attempts over 50 seconds
   private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
     for (let i = 0; i < 20; i++) {
       try {
@@ -531,7 +477,7 @@ export class LowLatencyExecutionEngine {
           return true;
         }
         if (status?.err) {
-          console.log(`❌ Tx failed on-chain: ${JSON.stringify(status.err)}`);
+          console.log(`\u274c Tx failed on-chain: ${JSON.stringify(status.err)}`);
           return false;
         }
       } catch {
