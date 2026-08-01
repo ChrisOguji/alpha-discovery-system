@@ -543,6 +543,24 @@ async function monitorPositions() {
         // ── TAKE PROFIT ──
         if (pnlPct >= tp) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
+
+          // ── Actually sell the position on-chain before treating it as
+          // closed — this is the fix for the bug where TP/SL only updated
+          // tracking and never sold anything for real. ──
+          let sellResult: { success: boolean; signature?: string; error?: string };
+          try {
+            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
+            sellTx.sign([executor.getWalletKeypair()]);
+            sellResult = await executor.executeSwap(sellTx);
+          } catch (e: any) {
+            sellResult = { success: false, error: e.message };
+          }
+
+          if (!sellResult.success) {
+            console.log(`❌ TP sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            return;
+          }
+
           const solUsd = await getSolUsd();
           const rec = alertHistory.get(address);
           try {
@@ -578,7 +596,7 @@ async function monitorPositions() {
             await saveHistory();
           }
           openPositions.delete(address);
-          console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
+          console.log(`✅ TP hit + sold: ${pos.ticker} +${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           return;
         }
 
@@ -587,6 +605,25 @@ async function monitorPositions() {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
           const everPumped = peakGainPct >= 40;
+
+          // ── Actually sell the position on-chain before treating it as
+          // closed — same fix as the TP side. This happens regardless of
+          // whether the card below gets announced, since the real money
+          // needs to be closed either way. ──
+          let sellResult: { success: boolean; signature?: string; error?: string };
+          try {
+            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
+            sellTx.sign([executor.getWalletKeypair()]);
+            sellResult = await executor.executeSwap(sellTx);
+          } catch (e: any) {
+            sellResult = { success: false, error: e.message };
+          }
+
+          if (!sellResult.success) {
+            console.log(`❌ SL sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            return;
+          }
+
           const rec = alertHistory.get(address);
 
           // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
@@ -628,9 +665,9 @@ async function monitorPositions() {
             } catch (e: any) {
               console.log(`⚠️ Failed to send SL card: ${e.message}`);
             }
-            console.log(`✅ SL hit (announced): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+            console.log(`✅ SL hit + sold (announced): ${pos.ticker} ${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           } else {
-            console.log(`✅ SL hit (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+            console.log(`✅ SL hit + sold (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           }
           return;
         }
