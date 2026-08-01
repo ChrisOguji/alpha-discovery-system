@@ -692,13 +692,26 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
 }
 
 // ── Calendar-aligned scheduling — these fire at real clock boundaries
+// ── Node's setTimeout silently overflows past ~24.8 days (2^31-1 ms) and
+// fires almost immediately instead of erroring — this is exactly what
+// caused the monthly recap to spam repeatedly. This wrapper chunks any
+// longer delay into safe pieces instead of one raw setTimeout call. ──
+const MAX_SAFE_TIMEOUT_MS = 2_147_483_647;
+function safeSetTimeout(fn: () => void, delayMs: number): void {
+  if (delayMs > MAX_SAFE_TIMEOUT_MS) {
+    setTimeout(() => safeSetTimeout(fn, delayMs - MAX_SAFE_TIMEOUT_MS), MAX_SAFE_TIMEOUT_MS);
+  } else {
+    setTimeout(fn, Math.max(delayMs, 0));
+  }
+}
+
 // (UTC midnight, noon, Sunday midnight), not "24h after the bot last
 // restarted" ──
 function scheduleDaily(fn: () => void, hourUTC: number): void {
   const now = new Date();
   const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hourUTC, 0, 0, 0));
   if (next.getTime() <= now.getTime()) next.setUTCDate(next.getUTCDate() + 1);
-  setTimeout(() => {
+  safeSetTimeout(() => {
     fn();
     setInterval(fn, 24 * 60 * 60 * 1000);
   }, next.getTime() - now.getTime());
@@ -712,7 +725,7 @@ function scheduleTwiceDaily(fn: () => void): void {
     return d.getTime();
   });
   const next = Math.min(...candidates);
-  setTimeout(() => {
+  safeSetTimeout(() => {
     fn();
     setInterval(fn, 12 * 60 * 60 * 1000);
   }, next - now.getTime());
@@ -724,24 +737,26 @@ function scheduleWeekly(fn: () => void, dayOfWeekUTC: number, hourUTC: number): 
   let daysUntil = (dayOfWeekUTC - next.getUTCDay() + 7) % 7;
   if (daysUntil === 0 && next.getTime() <= now.getTime()) daysUntil = 7;
   next.setUTCDate(next.getUTCDate() + daysUntil);
-  setTimeout(() => {
+  safeSetTimeout(() => {
     fn();
     setInterval(fn, 7 * 24 * 60 * 60 * 1000);
   }, next.getTime() - now.getTime());
 }
 
 // ── Months vary in length, so this recalculates the next 1st-of-month
-// boundary each time rather than using a fixed-interval setInterval ──
+// boundary each time rather than using a fixed-interval setInterval.
+// The gap between months can exceed setTimeout's safe limit (e.g. a
+// 31-day July→September gap), so this always goes through safeSetTimeout. ──
 function scheduleMonthly(fn: () => void, hourUTC: number): void {
   const runAndReschedule = () => {
     fn();
     const now = new Date();
     const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, hourUTC, 0, 0, 0));
-    setTimeout(runAndReschedule, next.getTime() - now.getTime());
+    safeSetTimeout(runAndReschedule, next.getTime() - now.getTime());
   };
   const now = new Date();
   const firstRun = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1, hourUTC, 0, 0, 0));
-  setTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
+  safeSetTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
 }
 
 async function scan() {
