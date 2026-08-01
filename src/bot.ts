@@ -1036,7 +1036,7 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
+          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
@@ -1054,7 +1054,7 @@ async function scan() {
           `• Unique Buyers: ${pattern.uniqueBuyers} \\(${pattern.buyerVelocity} velocity\\)`,
           `• Smart Money: ${pattern.smartCohortPresence ? '✅ Present' : '➖ None'}`,
           `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '✅ Confirmed'}`, ``,
-          `📊 *AI Intelligence Matrix:*`,
+          `📊 *Intelligence Matrix:*`,
           `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
           `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
           `• Dev Rug History: ${pattern.devRugHistoryCount} prior rugs`,
