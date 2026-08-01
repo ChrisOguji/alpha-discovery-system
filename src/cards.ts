@@ -265,16 +265,14 @@ export async function renderMilestoneCard(p: MilestoneCardParams): Promise<Buffe
   return canvas.toBuffer('image/png');
 }
 
-// ── Card 3: Recap card (daily / weekly / monthly) — hero winner, gainers
-// list, AND a losses list. Showing only winners would be misleading —
-// this is meant to be an honest performance snapshot. ──
+// ── Card 3: Recap card (daily / weekly / monthly) — hero winner + top 10
+// gainers list. ──
 export interface RecapCardParams {
   botName: string;
   periodTitle: string;
   heroTicker: string;
   heroMultiple: number;
   gainers: { ticker: string; multiple: number }[];
-  losses: { ticker: string; lossPct: number }[];
   statsLine?: string;
 }
 
@@ -299,48 +297,24 @@ export async function renderRecapCard(p: RecapCardParams): Promise<Buffer> {
   ctx.fillStyle = accent;
   ctx.fillText(`${p.heroMultiple.toFixed(1)}X`, 56, 250);
 
-  // Gainers list, top right
+  // Gainers list, top right — up to 10
   const listX = 640;
   let listY = 150;
   ctx.font = font(20);
   ctx.fillStyle = TEXT_MUTED;
   ctx.fillText('TOP GAINERS', listX, listY);
-  listY += 40;
+  listY += 38;
 
-  p.gainers.slice(0, 3).forEach((item, i) => {
-    ctx.font = font(26);
+  p.gainers.slice(0, 10).forEach((item, i) => {
+    ctx.font = font(24);
     ctx.fillStyle = TEXT_PRIMARY;
     ctx.fillText(`${i + 1}. $${item.ticker}`, listX, listY);
     ctx.fillStyle = GREEN;
     ctx.textAlign = 'right';
     ctx.fillText(`${item.multiple.toFixed(1)}x`, WIDTH - 56, listY);
     ctx.textAlign = 'left';
-    listY += 42;
+    listY += 36;
   });
-
-  // Losses list, bottom right — same treatment as gainers, no hiding it
-  listY += 20;
-  ctx.font = font(20);
-  ctx.fillStyle = TEXT_MUTED;
-  ctx.fillText('STOP LOSSES', listX, listY);
-  listY += 40;
-
-  if (p.losses.length === 0) {
-    ctx.font = font(24);
-    ctx.fillStyle = TEXT_MUTED;
-    ctx.fillText('None this period', listX, listY);
-  } else {
-    p.losses.slice(0, 3).forEach((item, i) => {
-      ctx.font = font(26);
-      ctx.fillStyle = TEXT_PRIMARY;
-      ctx.fillText(`${i + 1}. $${item.ticker}`, listX, listY);
-      ctx.fillStyle = RED;
-      ctx.textAlign = 'right';
-      ctx.fillText(`${item.lossPct.toFixed(1)}%`, WIDTH - 56, listY);
-      ctx.textAlign = 'left';
-      listY += 42;
-    });
-  }
 
   if (p.statsLine) {
     ctx.font = font(24);
