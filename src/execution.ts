@@ -369,6 +369,7 @@ export class LowLatencyExecutionEngine {
   // decimals, which varies per token — not the fixed 9 decimals SOL uses. ──
   public async getTokenBalance(mintAddress: string): Promise<{ rawAmount: bigint; decimals: number } | null> {
     if (!this.wallet) return null;
+    const wallet = this.wallet;
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
       const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
@@ -376,7 +377,7 @@ export class LowLatencyExecutionEngine {
         id: 1,
         method: 'getTokenAccountsByOwner',
         params: [
-          this.wallet.publicKey.toBase58(),
+          wallet.publicKey.toBase58(),
           { mint: mintAddress },
           { encoding: 'jsonParsed' }
         ]
@@ -398,6 +399,7 @@ export class LowLatencyExecutionEngine {
   // actually held, correctly scaled for that token's real decimals. ──
   public async buildJupiterSellTransaction(mint: string, slippageBps: number): Promise<VersionedTransaction> {
     if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
+    const wallet = this.wallet;
 
     const balance = await this.getTokenBalance(mint);
     if (!balance || balance.rawAmount === 0n) {
@@ -428,7 +430,7 @@ export class LowLatencyExecutionEngine {
 
     const swapTxRes = await this.withNetworkRetry(() => this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
-      userPublicKey: this.wallet.publicKey.toBase58(),
+      userPublicKey: wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: {
         priorityLevelWithMaxLamports: {
