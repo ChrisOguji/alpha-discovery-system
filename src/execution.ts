@@ -33,12 +33,41 @@ export class LowLatencyExecutionEngine {
   private readonly MAX_PRICE_IMPACT_PCT = 15;
 
   private client = axios.create({
-    httpsAgent: new https.Agent({ family: 4 }),
+    // ── keepAlive: false — reusing a connection the server already quietly
+    // closed is a known cause of TLS "internal error" alerts (exactly the
+    // EPROTO/ssl3_read_bytes error this was hit by). A fresh connection per
+    // request costs a little latency but avoids that failure mode entirely. ──
+    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'application/json'
     }
   });
+
+  // ── Retries a request-returning function up to `attempts` times on
+  // transient network-level failures (TLS drops, ECONNRESET, timeouts) —
+  // these aren't the RPC rejecting the request, the connection itself
+  // failed, so retrying fresh is the right response. Does NOT retry on
+  // a normal HTTP error response (4xx/5xx with a body) — those are real
+  // answers from the server, not network flakiness. ──
+  private async withNetworkRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+    let lastErr: any;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fn();
+      } catch (e: any) {
+        lastErr = e;
+        const isNetworkError = !e.response && (
+          e.code === 'EPROTO' || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' ||
+          e.code === 'ECONNREFUSED' || e.message?.includes('SSL') || e.message?.includes('socket hang up')
+        );
+        if (!isNetworkError || i === attempts - 1) throw e;
+        console.log(`⚠️ Network-level error (${e.code || e.message}), retrying (${i + 1}/${attempts})...`);
+        await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
+      }
+    }
+    throw lastErr;
+  }
 
   constructor() {
     const keyString = process.env.WALLET_PRIVATE_KEY || process.env.SOLANA_WALLET_PRIVATE_KEY || '';
@@ -118,12 +147,12 @@ export class LowLatencyExecutionEngine {
   } | null> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-      const res = await this.client.post(rpcUrl, {
+      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
         jsonrpc: '2.0',
         id: 1,
         method: 'getAccountInfo',
         params: [bondingCurve.toBase58(), { encoding: 'base64' }]
-      }, { timeout: 5000 });
+      }, { timeout: 5000 }));
 
       const data = res.data?.result?.value?.data?.[0];
       if (!data) return null;
@@ -244,11 +273,11 @@ export class LowLatencyExecutionEngine {
     if (state.complete) throw new Error('Token already graduated to Raydium — use Jupiter');
 
     const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-    const blockhashRes = await this.client.post(rpcUrl, {
+    const blockhashRes = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
       jsonrpc: '2.0', id: 1,
       method: 'getLatestBlockhash',
       params: [{ commitment: 'confirmed' }]
-    }, { timeout: 5000 });
+    }, { timeout: 5000 }));
     const blockhash = blockhashRes.data?.result?.value?.blockhash;
     if (!blockhash) throw new Error('Could not fetch blockhash');
 
@@ -298,7 +327,7 @@ export class LowLatencyExecutionEngine {
     const targetOutputMint = direction === 'BUY' ? outputMint : wsolMint;
     const computedUnits = Math.floor(solAmount * 1_000_000_000);
 
-    const quoteRes = await this.client.get(`${this.jupiterUrl}/quote`, {
+    const quoteRes = await this.withNetworkRetry(() => this.client.get(`${this.jupiterUrl}/quote`, {
       params: {
         inputMint,
         outputMint: targetOutputMint,
@@ -308,7 +337,7 @@ export class LowLatencyExecutionEngine {
         dynamicSlippage: true
       },
       timeout: 8000
-    });
+    }));
 
     // ── Trade protection: refuse to route into a pool so thin the trade itself moves
     // the price past our tolerance — this is the classic setup for a sandwich attack ──
@@ -319,7 +348,7 @@ export class LowLatencyExecutionEngine {
       );
     }
 
-    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
+    const swapTxRes = await this.withNetworkRetry(() => this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet!.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
@@ -329,7 +358,7 @@ export class LowLatencyExecutionEngine {
           priorityLevel: "veryHigh"
         }
       }
-    }, { timeout: 8000 });
+    }, { timeout: 8000 }));
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
     return VersionedTransaction.deserialize(swapBuffer);
@@ -342,7 +371,7 @@ export class LowLatencyExecutionEngine {
     if (!this.wallet) return null;
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-      const res = await this.client.post(rpcUrl, {
+      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
         jsonrpc: '2.0',
         id: 1,
         method: 'getTokenAccountsByOwner',
@@ -351,7 +380,7 @@ export class LowLatencyExecutionEngine {
           { mint: mintAddress },
           { encoding: 'jsonParsed' }
         ]
-      }, { timeout: 8000 });
+      }, { timeout: 8000 }));
 
       const account = res.data?.result?.value?.[0];
       if (!account) return null;
@@ -377,7 +406,7 @@ export class LowLatencyExecutionEngine {
 
     const wsolMint = 'So11111111111111111111111111111111111111112';
 
-    const quoteRes = await this.client.get(`${this.jupiterUrl}/quote`, {
+    const quoteRes = await this.withNetworkRetry(() => this.client.get(`${this.jupiterUrl}/quote`, {
       params: {
         inputMint: mint,
         outputMint: wsolMint,
@@ -387,7 +416,7 @@ export class LowLatencyExecutionEngine {
         dynamicSlippage: true
       },
       timeout: 8000
-    });
+    }));
 
     // ── Same thin-liquidity protection as the buy side ──
     const priceImpactPct = parseFloat(quoteRes.data?.priceImpactPct || '0') * 100;
@@ -397,7 +426,7 @@ export class LowLatencyExecutionEngine {
       );
     }
 
-    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
+    const swapTxRes = await this.withNetworkRetry(() => this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
@@ -407,7 +436,7 @@ export class LowLatencyExecutionEngine {
           priorityLevel: "veryHigh"
         }
       }
-    }, { timeout: 8000 });
+    }, { timeout: 8000 }));
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
     return VersionedTransaction.deserialize(swapBuffer);
@@ -431,7 +460,7 @@ export class LowLatencyExecutionEngine {
         ]
       };
 
-      const res = await this.client.post(rpcUrl, payload, { timeout: 8000 });
+      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, payload, { timeout: 8000 }));
 
       if (res.data?.result) {
         const signature = res.data.result;
