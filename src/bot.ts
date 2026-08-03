@@ -916,7 +916,7 @@ async function scan() {
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 40) {
+          if (ageMinutes < 30) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
