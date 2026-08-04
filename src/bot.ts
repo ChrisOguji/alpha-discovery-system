@@ -335,6 +335,51 @@ function computeRugProbability(mcap: number, liquidity: number): number {
   return 0.12;
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Lore/story-strength scoring — some tokens have a genuine, specific,
+// shareable narrative (real people, real events, a distinct concept)
+// instead of generic copy-paste PvP-relaunch language. That's a real
+// signal worth boosting, but judging it is a language task, not something
+// a keyword list can do reliably. Two-stage approach: a free heuristic
+// filters out anything too short/empty to even be a real story, THEN an
+// AI call judges only the survivors — keeps API usage cheap and bounded.
+// ─────────────────────────────────────────────────────────────────────────
+
+function hasLorePotential(description: string | undefined): boolean {
+  if (!description) return false;
+  const trimmed = description.trim();
+  if (trimmed.length < 60) return false; // too short to be a real story
+  const wordCount = trimmed.split(/\s+/).length;
+  return wordCount >= 12;
+}
+
+async function scoreLoreWithAI(ticker: string, description: string): Promise<number> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return 0;
+  try {
+    const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 10,
+      messages: [{
+        role: 'user',
+        content: `Rate how compelling and shareable this crypto token's story/lore is, on a scale of 0-100. A high score means a genuine, specific, unique narrative (real people, real events, a distinct concept) that could realistically go viral. A low score means generic, vague, templated, or copy-paste marketing language with no real story.\n\nToken: $${ticker}\nDescription: "${description}"\n\nRespond with ONLY a number from 0 to 100, nothing else.`
+      }]
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 8000
+    });
+    const text = res.data?.choices?.[0]?.message?.content?.trim() || '0';
+    const score = parseInt(text, 10);
+    return isNaN(score) ? 0 : Math.min(100, Math.max(0, score));
+  } catch (e: any) {
+    console.log(`⚠️ Lore scoring failed for ${ticker}: ${e.message}`);
+    return 0;
+  }
+}
+
 function isReversalCandidate(pair: any): boolean {
   const h24 = parseFloat(pair.priceChange?.h24 || '0');
   const h6 = parseFloat(pair.priceChange?.h6 || '0');
@@ -822,7 +867,7 @@ async function scan() {
     const profiles = profilesRes.data || [];
     const pumpProfiles = profiles
       .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
-      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
+      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles', description: p.description }));
 
     let pumpSwapProfiles: any[] = [];
     try {
@@ -924,8 +969,19 @@ async function scan() {
         }
 
         const rugProb = computeRugProbability(mcap, liquidity);
-        const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
+        let alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
         const scoreMin = isNew ? 70 : 75;
+
+        // ── Lore bonus: only tokens with an actual profile description
+        // (currently just the 'profiles' source) are eligible, and only
+        // ones that already pass the free heuristic filter get the AI call ──
+        if (p.description && hasLorePotential(p.description)) {
+          const loreScore = await scoreLoreWithAI(ticker, p.description);
+          if (loreScore >= 70) {
+            alphaScore = Math.min(100, alphaScore + 15);
+            console.log(`📖 Strong lore detected: ${ticker} (lore score ${loreScore}/100) — +15 alpha boost`);
+          }
+        }
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
@@ -1036,7 +1092,7 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
+          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
@@ -1054,7 +1110,7 @@ async function scan() {
           `• Unique Buyers: ${pattern.uniqueBuyers} \\(${pattern.buyerVelocity} velocity\\)`,
           `• Smart Money: ${pattern.smartCohortPresence ? '✅ Present' : '➖ None'}`,
           `• Pump\\.fun: ${pattern.isPumpFun ? '✅ Verified' : '✅ Confirmed'}`, ``,
-          `📊 *Intelligence Matrix:*`,
+          `📊 *AI Intelligence Matrix:*`,
           `• Alpha Score: 🟢 ${alphaScore}/100 — ${alphaScore === 100 ? '🔥 PERFECT SCORE' : '✅ HIGH CONVICTION'}`,
           `• Rug Probability: 🛡 ${(rugProb * 100).toFixed(0)}%`,
           `• Dev Rug History: ${pattern.devRugHistoryCount} prior rugs`,
