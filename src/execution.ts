@@ -6,10 +6,45 @@ import {
   Transaction,
   LAMPORTS_PER_SOL,
   TransactionInstruction,
-  AccountMeta
+  AccountMeta,
+  SystemProgram,
+  TransactionMessage
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import * as https from 'https';
+
+// ── Submission tuning (env-overridable, safe defaults) ──
+// A transient failure on a single RPC used to collapse the whole buy into a
+// generic "RPC network failure". The submission path now: (1) fans out across
+// every configured endpoint with rotation, (2) tries a tipped Jito bundle for
+// MEV protection then falls back to direct RPC, and (3) re-sends the IDENTICAL
+// signed tx a few times — Solana dedupes by signature so this cannot double
+// execute, it only raises the odds of the tx landing when the network drops it.
+const RPC_ENDPOINTS: string[] = [
+  process.env.QUICKNODE_RPC_URL,
+  process.env.SOLANA_RPC_URL,
+  process.env.SOLANA_RPC_URL_BACKUP,
+].filter((u): u is string => typeof u === 'string' && u.length > 0);
+
+const MAX_RPC_RETRIES  = parseInt(process.env.MAX_RPC_RETRIES  || '5', 10);
+const BLAST_COUNT      = parseInt(process.env.BLAST_COUNT      || '4', 10);
+const BLAST_INTERVAL_MS = parseInt(process.env.BLAST_INTERVAL_MS || '2000', 10);
+const RPC_SEND_RETRIES = parseInt(process.env.RPC_SEND_RETRIES || '3', 10);
+
+const JITO_ENABLED = (process.env.JITO_ENABLED || 'true').toLowerCase() !== 'false';
+const JITO_BUNDLE_URL = process.env.JITO_BUNDLE_URL
+  || 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
+const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || '100000', 10); // 0.0001 SOL
+const JITO_TIP_ACCOUNTS: string[] = [
+  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
+  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
+  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
+];
 
 // ── pump.fun program constants ──
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -29,45 +64,25 @@ export class LowLatencyExecutionEngine {
   private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
   private wallet: Keypair | null = null;
 
+  // ── RPC failover state ──
+  private rpcEndpoints: string[] = RPC_ENDPOINTS.length > 0
+    ? RPC_ENDPOINTS
+    : ['https://api.mainnet-beta.solana.com'];
+  private rpcIndex = 0;
+  private rpcId = 0;
+  // Keep strong refs to fire-and-forget blast/confirm tasks so they aren't GC'd.
+  private background: Set<Promise<void>> = new Set();
+
   // ── Trade protection: abort rather than execute into a thin/manipulated pool ──
   private readonly MAX_PRICE_IMPACT_PCT = 15;
 
   private client = axios.create({
-    // ── keepAlive: false — reusing a connection the server already quietly
-    // closed is a known cause of TLS "internal error" alerts (exactly the
-    // EPROTO/ssl3_read_bytes error this was hit by). A fresh connection per
-    // request costs a little latency but avoids that failure mode entirely. ──
-    httpsAgent: new https.Agent({ family: 4, keepAlive: false }),
+    httpsAgent: new https.Agent({ family: 4 }),
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36',
       'Accept': 'application/json'
     }
   });
-
-  // ── Retries a request-returning function up to `attempts` times on
-  // transient network-level failures (TLS drops, ECONNRESET, timeouts) —
-  // these aren't the RPC rejecting the request, the connection itself
-  // failed, so retrying fresh is the right response. Does NOT retry on
-  // a normal HTTP error response (4xx/5xx with a body) — those are real
-  // answers from the server, not network flakiness. ──
-  private async withNetworkRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
-    let lastErr: any;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        return await fn();
-      } catch (e: any) {
-        lastErr = e;
-        const isNetworkError = !e.response && (
-          e.code === 'EPROTO' || e.code === 'ECONNRESET' || e.code === 'ETIMEDOUT' ||
-          e.code === 'ECONNREFUSED' || e.message?.includes('SSL') || e.message?.includes('socket hang up')
-        );
-        if (!isNetworkError || i === attempts - 1) throw e;
-        console.log(`⚠️ Network-level error (${e.code || e.message}), retrying (${i + 1}/${attempts})...`);
-        await new Promise(resolve => setTimeout(resolve, 500 * (i + 1)));
-      }
-    }
-    throw lastErr;
-  }
 
   constructor() {
     const keyString = process.env.WALLET_PRIVATE_KEY || process.env.SOLANA_WALLET_PRIVATE_KEY || '';
@@ -147,12 +162,12 @@ export class LowLatencyExecutionEngine {
   } | null> {
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
+      const res = await this.client.post(rpcUrl, {
         jsonrpc: '2.0',
         id: 1,
         method: 'getAccountInfo',
         params: [bondingCurve.toBase58(), { encoding: 'base64' }]
-      }, { timeout: 5000 }));
+      }, { timeout: 5000 });
 
       const data = res.data?.result?.value?.data?.[0];
       if (!data) return null;
@@ -160,8 +175,8 @@ export class LowLatencyExecutionEngine {
       const buf = Buffer.from(data, 'base64');
       // Skip 8-byte discriminator
       // Layout: virtualTokenReserves (u64), virtualSolReserves (u64),
-      //         realTokenReserves (u64), realSolReserves (u64),
-      //         tokenTotalSupply (u64), complete (bool)
+      // realTokenReserves (u64), realSolReserves (u64),
+      // tokenTotalSupply (u64), complete (bool)
       if (buf.length < 49) return null;
       const virtualTokenReserves = buf.readBigUInt64LE(8);
       const virtualSolReserves   = buf.readBigUInt64LE(16);
@@ -273,11 +288,11 @@ export class LowLatencyExecutionEngine {
     if (state.complete) throw new Error('Token already graduated to Raydium — use Jupiter');
 
     const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-    const blockhashRes = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
+    const blockhashRes = await this.client.post(rpcUrl, {
       jsonrpc: '2.0', id: 1,
       method: 'getLatestBlockhash',
       params: [{ commitment: 'confirmed' }]
-    }, { timeout: 5000 }));
+    }, { timeout: 5000 });
     const blockhash = blockhashRes.data?.result?.value?.blockhash;
     if (!blockhash) throw new Error('Could not fetch blockhash');
 
@@ -327,7 +342,7 @@ export class LowLatencyExecutionEngine {
     const targetOutputMint = direction === 'BUY' ? outputMint : wsolMint;
     const computedUnits = Math.floor(solAmount * 1_000_000_000);
 
-    const quoteRes = await this.withNetworkRetry(() => this.client.get(`${this.jupiterUrl}/quote`, {
+    const quoteRes = await this.client.get(`${this.jupiterUrl}/quote`, {
       params: {
         inputMint,
         outputMint: targetOutputMint,
@@ -337,7 +352,7 @@ export class LowLatencyExecutionEngine {
         dynamicSlippage: true
       },
       timeout: 8000
-    }));
+    });
 
     // ── Trade protection: refuse to route into a pool so thin the trade itself moves
     // the price past our tolerance — this is the classic setup for a sandwich attack ──
@@ -348,7 +363,7 @@ export class LowLatencyExecutionEngine {
       );
     }
 
-    const swapTxRes = await this.withNetworkRetry(() => this.client.post(`${this.jupiterUrl}/swap`, {
+    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
       userPublicKey: this.wallet!.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
@@ -358,7 +373,7 @@ export class LowLatencyExecutionEngine {
           priorityLevel: "veryHigh"
         }
       }
-    }, { timeout: 8000 }));
+    }, { timeout: 8000 });
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
     return VersionedTransaction.deserialize(swapBuffer);
@@ -369,19 +384,18 @@ export class LowLatencyExecutionEngine {
   // decimals, which varies per token — not the fixed 9 decimals SOL uses. ──
   public async getTokenBalance(mintAddress: string): Promise<{ rawAmount: bigint; decimals: number } | null> {
     if (!this.wallet) return null;
-    const wallet = this.wallet;
     try {
       const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL || '';
-      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, {
+      const res = await this.client.post(rpcUrl, {
         jsonrpc: '2.0',
         id: 1,
         method: 'getTokenAccountsByOwner',
         params: [
-          wallet.publicKey.toBase58(),
+          this.wallet.publicKey.toBase58(),
           { mint: mintAddress },
           { encoding: 'jsonParsed' }
         ]
-      }, { timeout: 8000 }));
+      }, { timeout: 8000 });
 
       const account = res.data?.result?.value?.[0];
       if (!account) return null;
@@ -399,7 +413,6 @@ export class LowLatencyExecutionEngine {
   // actually held, correctly scaled for that token's real decimals. ──
   public async buildJupiterSellTransaction(mint: string, slippageBps: number): Promise<VersionedTransaction> {
     if (!this.wallet) throw new Error('No wallet configured. Use /settings to set your wallet.');
-    const wallet = this.wallet;
 
     const balance = await this.getTokenBalance(mint);
     if (!balance || balance.rawAmount === 0n) {
@@ -408,7 +421,7 @@ export class LowLatencyExecutionEngine {
 
     const wsolMint = 'So11111111111111111111111111111111111111112';
 
-    const quoteRes = await this.withNetworkRetry(() => this.client.get(`${this.jupiterUrl}/quote`, {
+    const quoteRes = await this.client.get(`${this.jupiterUrl}/quote`, {
       params: {
         inputMint: mint,
         outputMint: wsolMint,
@@ -418,7 +431,7 @@ export class LowLatencyExecutionEngine {
         dynamicSlippage: true
       },
       timeout: 8000
-    }));
+    });
 
     // ── Same thin-liquidity protection as the buy side ──
     const priceImpactPct = parseFloat(quoteRes.data?.priceImpactPct || '0') * 100;
@@ -428,9 +441,9 @@ export class LowLatencyExecutionEngine {
       );
     }
 
-    const swapTxRes = await this.withNetworkRetry(() => this.client.post(`${this.jupiterUrl}/swap`, {
+    const swapTxRes = await this.client.post(`${this.jupiterUrl}/swap`, {
       quoteResponse: quoteRes.data,
-      userPublicKey: wallet.publicKey.toBase58(),
+      userPublicKey: this.wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       prioritizationFeeLamports: {
         priorityLevelWithMaxLamports: {
@@ -438,71 +451,225 @@ export class LowLatencyExecutionEngine {
           priorityLevel: "veryHigh"
         }
       }
-    }, { timeout: 8000 }));
+    }, { timeout: 8000 });
 
     const swapBuffer = Buffer.from(swapTxRes.data.swapTransaction, 'base64');
     return VersionedTransaction.deserialize(swapBuffer);
   }
 
-  // ✅ Send straight via RPC and wait for real on-chain confirmation before
-  // reporting success — no Jito bundle involved, per request to simplify
-  // the execution path down to a single straightforward Jupiter/RPC flow.
-  public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
-    try {
-      const rpcUrl = process.env.QUICKNODE_RPC_URL || process.env.SOLANA_RPC_URL;
-      if (!rpcUrl) return { success: false, error: 'No RPC URL available' };
+  // ── JSON-RPC call with automatic failover across every configured endpoint.
+  // A dead/slow/rate-limited node rotates to the next one and retries with
+  // backoff instead of bubbling up as a fatal "RPC network failure". ──
+  private async rpc(method: string, params: any[], retries = RPC_SEND_RETRIES): Promise<any> {
+    this.rpcId += 1;
+    const payload = { jsonrpc: '2.0', id: this.rpcId, method, params };
 
-      const payload = {
-        jsonrpc: "2.0",
-        id: 1,
-        method: "sendTransaction",
-        params: [
-          Buffer.from(tx.serialize()).toString('base64'),
-          { encoding: "base64", maxRetries: 3, skipPreflight: true }
-        ]
-      };
-
-      const res = await this.withNetworkRetry(() => this.client.post(rpcUrl, payload, { timeout: 8000 }));
-
-      if (res.data?.result) {
-        const signature = res.data.result;
-        console.log(`\ud83d\udcdd Tx signature: ${signature}`);
-        console.log(`\ud83d\udd0d Check: https://solscan.io/tx/${signature}`);
-
-        const confirmed = await this.confirmTransaction(signature, rpcUrl);
-        if (confirmed) {
-          console.log(`\u2705 Tx confirmed on-chain: ${signature}`);
-          return { success: true, signature };
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < Math.max(1, retries); attempt++) {
+      const url = this.rpcEndpoints[this.rpcIndex % this.rpcEndpoints.length];
+      try {
+        const res = await this.client.post(url, payload, { timeout: 8000 });
+        const err = res.data?.error;
+        if (err) {
+          // Rate limit / node-side failure → rotate and retry.
+          const code = err.code;
+          if (code === -32005 || code === -32603 || code === 429) {
+            this.rotateRpc();
+            lastErr = err;
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+            continue;
+          }
+          // A real program/tx error is not a transport failure — return it.
+          return { error: err };
         }
-
-        console.log(`\u26a0\ufe0f Tx not confirmed after 50s \u2014 treating as failed: https://solscan.io/tx/${signature}`);
-        return { success: false, error: 'Transaction not confirmed on-chain within 50s' };
+        return { result: res.data?.result };
+      } catch (e: any) {
+        lastErr = e;
+        this.rotateRpc();
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
       }
+    }
+    return { error: lastErr };
+  }
 
-      return { success: false, error: res.data?.error?.message || 'RPC Rejected' };
-    } catch (e: any) {
-      const status = e.response?.status;
-      const body = e.response?.data;
-      console.log(
-        `\u26a0\ufe0f Swap send failed${status ? ` (HTTP ${status})` : ''}: ${e.message}${body ? ` \u2014 response: ${JSON.stringify(body)}` : ''}`
-      );
-      return { success: false, error: 'RPC network failure' };
+  private rotateRpc(): void {
+    if (this.rpcEndpoints.length > 1) {
+      this.rpcIndex = (this.rpcIndex + 1) % this.rpcEndpoints.length;
     }
   }
 
-  // \u2705 Background confirmation \u2014 20 attempts over 50 seconds
-  private async confirmTransaction(signature: string, rpcUrl: string): Promise<boolean> {
-    for (let i = 0; i < 20; i++) {
-      try {
-        await new Promise(resolve => setTimeout(resolve, 2500));
-        const res = await this.client.post(rpcUrl, {
-          jsonrpc: "2.0",
-          id: 1,
-          method: "getSignatureStatuses",
-          params: [[signature], { searchTransactionHistory: true }]
-        }, { timeout: 5000 });
+  private spawn(p: Promise<void>): void {
+    this.background.add(p);
+    p.finally(() => this.background.delete(p));
+  }
 
-        const status = res.data?.result?.value?.[0];
+  // ── Build the Jito tip transaction. Untipped bundles get rejected (400),
+  // so the tip rides as a second transaction in the same atomic bundle —
+  // this avoids decompiling and rebuilding Jupiter's versioned tx (which
+  // carries address-lookup tables) just to append an instruction. ──
+  private async buildJitoTipTransaction(): Promise<VersionedTransaction | null> {
+    if (!this.wallet) return null;
+    try {
+      const blockhash = await this.getLatestBlockhashStr();
+      if (!blockhash) return null;
+      const tipAccount = new PublicKey(
+        JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
+      );
+      const ix = SystemProgram.transfer({
+        fromPubkey: this.wallet.publicKey,
+        toPubkey: tipAccount,
+        lamports: JITO_TIP_LAMPORTS,
+      });
+      const msg = new TransactionMessage({
+        payerKey: this.wallet.publicKey,
+        recentBlockhash: blockhash,
+        instructions: [ix],
+      }).compileToV0Message();
+      const tipTx = new VersionedTransaction(msg);
+      tipTx.sign([this.wallet]);
+      return tipTx;
+    } catch (e: any) {
+      console.log(`\u26a0\ufe0f Failed to build Jito tip tx: ${e.message}`);
+      return null;
+    }
+  }
+
+  private async getLatestBlockhashStr(): Promise<string | null> {
+    const out = await this.rpc('getLatestBlockhash', [{ commitment: 'confirmed' }]);
+    return out.result?.value?.blockhash || null;
+  }
+
+  // ── Submit a tipped [swap, tip] bundle to Jito. Returns true only if the
+  // block engine accepts it; any rejection/error falls back to direct RPC. ──
+  private async sendJitoBundle(bundle: string[]): Promise<boolean> {
+    try {
+      const res = await this.client.post(JITO_BUNDLE_URL, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'sendBundle',
+        params: [bundle, { encoding: 'base64' }],
+      }, { timeout: 8000 });
+      if (res.data?.error) {
+        console.log(`\u26a0\ufe0f Jito rejected bundle: ${JSON.stringify(res.data.error)}`);
+        return false;
+      }
+      return Boolean(res.data?.result);
+    } catch (e: any) {
+      console.log(`\u26a0\ufe0f Jito bundle send failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  // ── One sendTransaction across the failover RPC pool. ──
+  private async sendRaw(encodedTx: string): Promise<string | null> {
+    const out = await this.rpc('sendTransaction', [
+      encodedTx,
+      {
+        encoding: 'base64',
+        skipPreflight: true,
+        maxRetries: MAX_RPC_RETRIES,
+        preflightCommitment: 'processed',
+      },
+    ]);
+    return typeof out.result === 'string' ? out.result : null;
+  }
+
+  // ── Re-send the IDENTICAL signed tx BLAST_COUNT times. Solana dedupes by
+  // signature, so this can never double-execute the buy — it only raises the
+  // odds of landing when the network drops the first send. Halts early once
+  // the tx is confirmed. This was the single biggest cause of missed buys. ──
+  private async blast(encodedTx: string, signature: string): Promise<void> {
+    for (let i = 0; i < BLAST_COUNT; i++) {
+      await new Promise(r => setTimeout(r, BLAST_INTERVAL_MS));
+      try {
+        if (await this.isConfirmed(signature)) return;
+        await this.sendRaw(encodedTx);
+        console.log(`\ud83d\udd01 blast ${i + 1}/${BLAST_COUNT} ${signature.slice(0, 8)}...`);
+      } catch { /* keep blasting */ }
+    }
+  }
+
+  // ✅ Broadcast the signed swap: Jito bundle (MEV protection) → direct RPC
+  // fallback → retry-blast + background confirmation. Failover across every
+  // configured endpoint means a single node hiccup no longer aborts the buy.
+  public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
+    if (this.rpcEndpoints.length === 0) return { success: false, error: 'No RPC URL available' };
+
+    let encoded: string;
+    let signature: string;
+    try {
+      encoded = Buffer.from(tx.serialize()).toString('base64');
+      signature = bs58.encode(tx.signatures[0]);
+    } catch (e: any) {
+      return { success: false, error: `Failed to serialize transaction: ${e.message}` };
+    }
+
+    // ── 1. Jito bundle (swap + tip) with graceful fallback ──
+    if (JITO_ENABLED && this.wallet) {
+      try {
+        const tipTx = await this.buildJitoTipTransaction();
+        if (tipTx) {
+          const bundle = [
+            Buffer.from(tipTx.serialize()).toString('base64'),
+            encoded,
+          ];
+          if (await this.sendJitoBundle(bundle)) {
+            console.log(`\ud83d\udce6 Jito bundle accepted: https://solscan.io/tx/${signature}`);
+            this.spawn(this.blast(encoded, signature));
+            const confirmed = await this.confirmTransaction(signature);
+            if (confirmed) {
+              console.log(`\u2705 Tx confirmed on-chain: ${signature}`);
+              return { success: true, signature };
+            }
+            console.log(`\u26a0\ufe0f Jito tx not confirmed in time \u2014 treating as failed: https://solscan.io/tx/${signature}`);
+            return { success: false, signature, error: 'Transaction not confirmed on-chain within timeout' };
+          }
+        }
+        console.log('\u2139\ufe0f Jito unavailable \u2014 falling back to direct RPC');
+      } catch (e: any) {
+        console.log(`\u2139\ufe0f Jito path errored (${e.message}) \u2014 falling back to direct RPC`);
+      }
+    }
+
+    // ── 2. Direct RPC with failover ──
+    const first = await this.sendRaw(encoded);
+    if (!first) {
+      // The blast may still land it; keep trying in the background but report.
+      this.spawn(this.blast(encoded, signature));
+      return { success: false, signature, error: 'RPC send failed on all endpoints' };
+    }
+
+    console.log(`\ud83d\ude80 Tx dispatched via RPC: ${first}`);
+    console.log(`\ud83d\udd0d Check: https://solscan.io/tx/${first}`);
+
+    // ── 3. Retry-blast (background) + confirm ──
+    this.spawn(this.blast(encoded, first));
+    const confirmed = await this.confirmTransaction(first);
+    if (confirmed) {
+      console.log(`\u2705 Tx confirmed on-chain: ${first}`);
+      return { success: true, signature: first };
+    }
+
+    console.log(`\u26a0\ufe0f Tx not confirmed in time \u2014 treating as failed: https://solscan.io/tx/${first}`);
+    return { success: false, signature: first, error: 'Transaction not confirmed on-chain within timeout' };
+  }
+
+  // ── Single status check across the failover RPC pool. ──
+  private async isConfirmed(signature: string): Promise<boolean> {
+    const out = await this.rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: false }]);
+    const status = out.result?.value?.[0];
+    if (!status) return false;
+    if (status.err) return false;
+    return status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized';
+  }
+
+  // ✅ Confirmation polling — 20 attempts over ~50 seconds, failover-aware.
+  private async confirmTransaction(signature: string): Promise<boolean> {
+    for (let i = 0; i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      try {
+        const out = await this.rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]);
+        const status = out.result?.value?.[0];
         if (status?.confirmationStatus === 'confirmed' ||
             status?.confirmationStatus === 'finalized') {
           return true;
