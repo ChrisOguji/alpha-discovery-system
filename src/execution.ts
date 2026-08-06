@@ -6,9 +6,7 @@ import {
   Transaction,
   LAMPORTS_PER_SOL,
   TransactionInstruction,
-  AccountMeta,
-  SystemProgram,
-  TransactionMessage
+  AccountMeta
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import * as https from 'https';
@@ -16,10 +14,11 @@ import * as https from 'https';
 // ── Submission tuning (env-overridable, safe defaults) ──
 // A transient failure on a single RPC used to collapse the whole buy into a
 // generic "RPC network failure". The submission path now: (1) fans out across
-// every configured endpoint with rotation, (2) tries a tipped Jito bundle for
-// MEV protection then falls back to direct RPC, and (3) re-sends the IDENTICAL
+// every configured endpoint with rotation, and (2) re-sends the IDENTICAL
 // signed tx a few times — Solana dedupes by signature so this cannot double
-// execute, it only raises the odds of the tx landing when the network drops it.
+// execute, it only raises the odds of the tx landing when the network drops
+// the first send. The swap itself is built and routed by Jupiter upstream;
+// this layer only broadcasts it.
 const RPC_ENDPOINTS: string[] = [
   process.env.QUICKNODE_RPC_URL,
   process.env.SOLANA_RPC_URL,
@@ -30,21 +29,6 @@ const MAX_RPC_RETRIES  = parseInt(process.env.MAX_RPC_RETRIES  || '5', 10);
 const BLAST_COUNT      = parseInt(process.env.BLAST_COUNT      || '4', 10);
 const BLAST_INTERVAL_MS = parseInt(process.env.BLAST_INTERVAL_MS || '2000', 10);
 const RPC_SEND_RETRIES = parseInt(process.env.RPC_SEND_RETRIES || '3', 10);
-
-const JITO_ENABLED = (process.env.JITO_ENABLED || 'true').toLowerCase() !== 'false';
-const JITO_BUNDLE_URL = process.env.JITO_BUNDLE_URL
-  || 'https://mainnet.block-engine.jito.wtf/api/v1/bundles';
-const JITO_TIP_LAMPORTS = parseInt(process.env.JITO_TIP_LAMPORTS || '100000', 10); // 0.0001 SOL
-const JITO_TIP_ACCOUNTS: string[] = [
-  '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
-  'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
-  'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
-  'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
-  'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
-  'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
-  'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
-  '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT',
-];
 
 // ── pump.fun program constants ──
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
@@ -503,63 +487,6 @@ export class LowLatencyExecutionEngine {
     p.finally(() => this.background.delete(p));
   }
 
-  // ── Build the Jito tip transaction. Untipped bundles get rejected (400),
-  // so the tip rides as a second transaction in the same atomic bundle —
-  // this avoids decompiling and rebuilding Jupiter's versioned tx (which
-  // carries address-lookup tables) just to append an instruction. ──
-  private async buildJitoTipTransaction(): Promise<VersionedTransaction | null> {
-    if (!this.wallet) return null;
-    try {
-      const blockhash = await this.getLatestBlockhashStr();
-      if (!blockhash) return null;
-      const tipAccount = new PublicKey(
-        JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]
-      );
-      const ix = SystemProgram.transfer({
-        fromPubkey: this.wallet.publicKey,
-        toPubkey: tipAccount,
-        lamports: JITO_TIP_LAMPORTS,
-      });
-      const msg = new TransactionMessage({
-        payerKey: this.wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: [ix],
-      }).compileToV0Message();
-      const tipTx = new VersionedTransaction(msg);
-      tipTx.sign([this.wallet]);
-      return tipTx;
-    } catch (e: any) {
-      console.log(`\u26a0\ufe0f Failed to build Jito tip tx: ${e.message}`);
-      return null;
-    }
-  }
-
-  private async getLatestBlockhashStr(): Promise<string | null> {
-    const out = await this.rpc('getLatestBlockhash', [{ commitment: 'confirmed' }]);
-    return out.result?.value?.blockhash || null;
-  }
-
-  // ── Submit a tipped [swap, tip] bundle to Jito. Returns true only if the
-  // block engine accepts it; any rejection/error falls back to direct RPC. ──
-  private async sendJitoBundle(bundle: string[]): Promise<boolean> {
-    try {
-      const res = await this.client.post(JITO_BUNDLE_URL, {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'sendBundle',
-        params: [bundle, { encoding: 'base64' }],
-      }, { timeout: 8000 });
-      if (res.data?.error) {
-        console.log(`\u26a0\ufe0f Jito rejected bundle: ${JSON.stringify(res.data.error)}`);
-        return false;
-      }
-      return Boolean(res.data?.result);
-    } catch (e: any) {
-      console.log(`\u26a0\ufe0f Jito bundle send failed: ${e.message}`);
-      return false;
-    }
-  }
-
   // ── One sendTransaction across the failover RPC pool. ──
   private async sendRaw(encodedTx: string): Promise<string | null> {
     const out = await this.rpc('sendTransaction', [
@@ -589,9 +516,11 @@ export class LowLatencyExecutionEngine {
     }
   }
 
-  // ✅ Broadcast the signed swap: Jito bundle (MEV protection) → direct RPC
-  // fallback → retry-blast + background confirmation. Failover across every
-  // configured endpoint means a single node hiccup no longer aborts the buy.
+  // ✅ Broadcast the Jupiter-built signed swap directly via RPC with endpoint
+  // failover + retry-blast + background confirmation. No Jito bundle — the tx
+  // is sent straight to sendTransaction across the endpoint pool, so a single
+  // node hiccup no longer aborts the buy. Priority fee (for landing speed)
+  // belongs in the Jupiter swap request at build time, not here.
   public async executeSwap(tx: VersionedTransaction): Promise<{ success: boolean; signature?: string; error?: string }> {
     if (this.rpcEndpoints.length === 0) return { success: false, error: 'No RPC URL available' };
 
@@ -604,34 +533,7 @@ export class LowLatencyExecutionEngine {
       return { success: false, error: `Failed to serialize transaction: ${e.message}` };
     }
 
-    // ── 1. Jito bundle (swap + tip) with graceful fallback ──
-    if (JITO_ENABLED && this.wallet) {
-      try {
-        const tipTx = await this.buildJitoTipTransaction();
-        if (tipTx) {
-          const bundle = [
-            Buffer.from(tipTx.serialize()).toString('base64'),
-            encoded,
-          ];
-          if (await this.sendJitoBundle(bundle)) {
-            console.log(`\ud83d\udce6 Jito bundle accepted: https://solscan.io/tx/${signature}`);
-            this.spawn(this.blast(encoded, signature));
-            const confirmed = await this.confirmTransaction(signature);
-            if (confirmed) {
-              console.log(`\u2705 Tx confirmed on-chain: ${signature}`);
-              return { success: true, signature };
-            }
-            console.log(`\u26a0\ufe0f Jito tx not confirmed in time \u2014 treating as failed: https://solscan.io/tx/${signature}`);
-            return { success: false, signature, error: 'Transaction not confirmed on-chain within timeout' };
-          }
-        }
-        console.log('\u2139\ufe0f Jito unavailable \u2014 falling back to direct RPC');
-      } catch (e: any) {
-        console.log(`\u2139\ufe0f Jito path errored (${e.message}) \u2014 falling back to direct RPC`);
-      }
-    }
-
-    // ── 2. Direct RPC with failover ──
+    // ── Direct RPC send with failover ──
     const first = await this.sendRaw(encoded);
     if (!first) {
       // The blast may still land it; keep trying in the background but report.
@@ -642,7 +544,7 @@ export class LowLatencyExecutionEngine {
     console.log(`\ud83d\ude80 Tx dispatched via RPC: ${first}`);
     console.log(`\ud83d\udd0d Check: https://solscan.io/tx/${first}`);
 
-    // ── 3. Retry-blast (background) + confirm ──
+    // ── Retry-blast (background) + confirm ──
     this.spawn(this.blast(encoded, first));
     const confirmed = await this.confirmTransaction(first);
     if (confirmed) {
