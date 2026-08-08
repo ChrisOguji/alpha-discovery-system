@@ -205,12 +205,7 @@ async function loadHistory() {
 
   // ✅ Supabase fallback
   try {
-    const result = await db.query(`
-      SELECT address, ticker, alert_time, alert_mcap, alert_price,
-             peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-             exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
-      FROM alert_history ORDER BY alert_time DESC LIMIT 500
-    `);
+    const result = await db.query(` SELECT address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit FROM alert_history ORDER BY alert_time DESC LIMIT 500 `);
     for (const row of result.rows) {
       alertHistory.set(row.address, {
         ticker: row.ticker,
@@ -257,26 +252,7 @@ async function saveHistory() {
       continue;
     }
     try {
-      await db.query(`
-        INSERT INTO alert_history (
-          address, ticker, alert_time, alert_mcap, alert_price,
-          peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-          exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-        ON CONFLICT (address) DO UPDATE SET
-          peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap),
-          peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price),
-          peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price
-                     THEN EXCLUDED.peak_time ELSE alert_history.peak_time END,
-          current_mcap = EXCLUDED.current_mcap,
-          current_price = EXCLUDED.current_price,
-          last_updated = EXCLUDED.last_updated,
-          exit_reason = EXCLUDED.exit_reason,
-          exit_price = EXCLUDED.exit_price,
-          exit_mcap = EXCLUDED.exit_mcap,
-          exit_time = EXCLUDED.exit_time,
-          milestones_hit = EXCLUDED.milestones_hit
-      `, [
+      await db.query(` INSERT INTO alert_history ( address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT (address) DO UPDATE SET peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap), peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price), peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price THEN EXCLUDED.peak_time ELSE alert_history.peak_time END, current_mcap = EXCLUDED.current_mcap, current_price = EXCLUDED.current_price, last_updated = EXCLUDED.last_updated, exit_reason = EXCLUDED.exit_reason, exit_price = EXCLUDED.exit_price, exit_mcap = EXCLUDED.exit_mcap, exit_time = EXCLUDED.exit_time, milestones_hit = EXCLUDED.milestones_hit `, [
         rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
         rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated,
         rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null,
@@ -307,7 +283,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  if (mcap >= 1000 && mcap <= 40000) score += 25;
+  if (mcap >= 1000 && mcap <= 50000) score += 25;
 
   // ── Liquidity scoring: ratio bonus for $10k–$17k range, raw otherwise ──
   if (mcap >= 10000 && mcap <= 17000) {
@@ -560,6 +536,7 @@ async function monitorPositions() {
                   alertMcap: rec.alertMcap,
                   peakMcap: updated.peakMcap,
                   pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
+                  heldMinutes: Math.floor((now - rec.alertTime) / 60000),
                   logoUrl,
                 });
                 await bot.telegram.sendPhoto(CHAT_ID, { source: card });
@@ -737,18 +714,29 @@ function gainMultiple(rec: AlertRecord): number {
   return rec.alertPrice > 0 ? rec.peakPrice / rec.alertPrice : 0;
 }
 
+// ── Human-readable date/date-range for the recap cards ──
+function formatCardDateLine(windowMs: number): string {
+  const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const end = new Date();
+  if (windowMs <= 24 * 60 * 60 * 1000) return fmt(end);
+  const start = new Date(Date.now() - windowMs);
+  return `${fmt(start)} - ${fmt(end)}`;
+}
+
 async function postTopGainers(windowMs: number, title: string): Promise<void> {
   const cutoff = Date.now() - windowMs;
   const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
   if (inWindow.length === 0) return;
 
-  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
+  // ── Show every token from the window on the card, not just a top-10 slice ──
+  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a));
   const hero = ranked[0];
 
   try {
     const card = await renderRecapCard({
       botName: DENGINE_NAME,
       periodTitle: `Top Gainers — ${title}`,
+      dateLine: formatCardDateLine(windowMs),
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
@@ -771,7 +759,8 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
   const wins = inWindow.filter(r => gainMultiple(r) >= 1.4).length;
   const losses = inWindow.filter(r => gainMultiple(r) < 1.3).length;
 
-  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
+  // ── Show every token from the window on the card, not just a top-10 slice ──
+  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a));
   const hero = gainersRanked[0];
   if (!hero) return;
 
@@ -779,6 +768,7 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
     const card = await renderRecapCard({
       botName: DENGINE_NAME,
       periodTitle,
+      dateLine: formatCardDateLine(windowMs),
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: gainersRanked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
@@ -907,7 +897,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 5000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 40000
+          parseFloat(p.fdv || p.marketCap || '0') <= 50000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -951,12 +941,19 @@ async function scan() {
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
         if (!mcap) { markSeen(p.tokenAddress); continue; }
 
+        // ── Duplicate-alert fix: seenTokens is a 500-entry FIFO cache that
+        // can evict an address well before it's actually done being tracked,
+        // letting it re-qualify and get alerted (and spammed to Telegram) a
+        // second time. alertHistory is the durable, DB-backed source of
+        // truth for "has this token already been alerted" — check that too. ──
+        if (alertHistory.has(address)) { markSeen(p.tokenAddress); continue; }
+
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 5000 : 10000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 40000) continue;
+        if (mcap < mcapMin || mcap > 50000) continue;
 
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
@@ -1092,7 +1089,7 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
+          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
@@ -1140,25 +1137,7 @@ async function init() {
 
   // ✅ Create alert_history table if not exists
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS alert_history (
-        address TEXT PRIMARY KEY,
-        ticker TEXT,
-        alert_time BIGINT,
-        alert_mcap NUMERIC,
-        alert_price NUMERIC,
-        peak_mcap NUMERIC,
-        peak_price NUMERIC,
-        peak_time BIGINT,
-        current_mcap NUMERIC,
-        current_price NUMERIC,
-        last_updated BIGINT,
-        exit_reason TEXT,
-        exit_price NUMERIC,
-        exit_mcap NUMERIC,
-        exit_time BIGINT
-      );
-    `);
+    await db.query(` CREATE TABLE IF NOT EXISTS alert_history ( address TEXT PRIMARY KEY, ticker TEXT, alert_time BIGINT, alert_mcap NUMERIC, alert_price NUMERIC, peak_mcap NUMERIC, peak_price NUMERIC, peak_time BIGINT, current_mcap NUMERIC, current_price NUMERIC, last_updated BIGINT, exit_reason TEXT, exit_price NUMERIC, exit_mcap NUMERIC, exit_time BIGINT ); `);
     // ── Finding 1: backfill exit columns on tables created before this fix ──
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_reason TEXT`);
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_price NUMERIC`);
@@ -1203,7 +1182,7 @@ bot.launch({
   // Robinhood Chain temporarily disabled — re-enable by uncommenting the import
   // at the top of this file and restoring this block.
   // if (botSettings.robinhoodEnabled) {
-  //   startPonsFactoryListener();
+  // startPonsFactoryListener();
   // }
   scan();
   setInterval(scan, 60000);
@@ -1233,9 +1212,9 @@ bot.command('positions', async (ctx) => {
   for (const [address, pos] of openPositions.entries()) {
     const mins = Math.floor((Date.now() - pos.entryTime) / 60000);
     lines.push(`• $${escapeText(pos.ticker)} — ${pos.sizeSol} SOL — ${mins}m held`);
-    lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
-    lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
-    lines.push(`  Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
+    lines.push(` Entry: $${pos.entryPrice.toFixed(8)}`);
+    lines.push(` Peak: $${pos.peakPrice.toFixed(8)}`);
+    lines.push(` Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
     lines.push('');
   }
   if (pendingEntries.size > 0) {
@@ -1295,10 +1274,13 @@ if (period === 'daily') {
 } else {
   cutoff = 0;
 }
+  // ── Show every token in the period — only capped at 100, which is
+  // Telegram's actual hard limit on inline keyboard buttons, not an
+  // arbitrary product limit. ──
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
-    .slice(0, 20);
+    .slice(0, 100);
 
   const periodLabel: Record<string, string> = {
     daily: '📅 Daily', weekly: '📆 Weekly',
