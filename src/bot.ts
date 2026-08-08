@@ -1089,7 +1089,7 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
+          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
@@ -1260,7 +1260,7 @@ function getPeriodDateString(period: string): string {
   return escapeText(dateString);
 }
 
-async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[] }> {
+async function buildPeriodPnlMessage(period: string): Promise<{ text: string; buttons: any[]; records: [string, AlertRecord][] }> {
   const now = Date.now();
   let cutoff: number;
 if (period === 'daily') {
@@ -1302,7 +1302,8 @@ if (period === 'daily') {
 
   return {
     text: `📊 *${periodLabel[period]} Calls \\(${dateInterval}\\) \\(${filtered.length} tokens\\):*`,
-    buttons
+    buttons,
+    records: filtered,
   };
 }
 
@@ -1329,7 +1330,7 @@ bot.command('pnl', async (ctx) => {
 bot.action(/^period_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery("Refreshing...");
   const period = ctx.match[1];
-  const { text, buttons } = await buildPeriodPnlMessage(period);
+  const { text, buttons, records } = await buildPeriodPnlMessage(period);
   // buttons.length === 1 means only the refresh button, no tokens found
   if (buttons.length <= 1) {
     try { await ctx.editMessageText("📭 No alerts found for the selected period."); } catch {}
@@ -1338,6 +1339,35 @@ bot.action(/^period_(.+)$/, async (ctx) => {
   try {
     await ctx.editMessageText(text, { parse_mode: "Markdown", ...Markup.inlineKeyboard(buttons) });
   } catch {}
+
+  // ── Also send the daily/weekly/monthly recap card, built from the exact
+  // same tokens shown in the list above — not requested for Lifetime. ──
+  if (period === 'daily' || period === 'weekly' || period === 'monthly') {
+    const inWindow = records.map(([, rec]) => rec).filter(r => r.alertPrice > 0);
+    if (inWindow.length > 0) {
+      const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a));
+      const hero = gainersRanked[0];
+      const wins = inWindow.filter(r => gainMultiple(r) >= 1.4).length;
+      const losses = inWindow.filter(r => gainMultiple(r) < 1.3).length;
+      const periodTitleMap: Record<string, string> = {
+        daily: 'Daily Recap', weekly: 'Weekly Recap', monthly: 'Monthly Recap',
+      };
+      try {
+        const card = await renderRecapCard({
+          botName: DENGINE_NAME,
+          periodTitle: periodTitleMap[period],
+          dateLine: getPeriodDateString(period),
+          heroTicker: hero.ticker,
+          heroMultiple: gainMultiple(hero),
+          gainers: gainersRanked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
+          statsLine: `${inWindow.length} calls · ${wins} wins · ${losses} losses`,
+        });
+        await bot.telegram.sendPhoto(ctx.chat!.id, { source: card });
+      } catch (e: any) {
+        console.log(`⚠️ Failed to send /pnl period recap card: ${e.message}`);
+      }
+    }
+  }
 });
 
 bot.command('winrate', async (ctx) => {
@@ -1463,6 +1493,7 @@ bot.action(/^pnl_(.+)$/, async (ctx) => {
         peakPct,
         multiple: rec.peakPrice / rec.alertPrice,
         neverPumped: peakPct < 30,
+        peakMinutes: Math.max(0, Math.floor((rec.peakTime - rec.alertTime) / 60000)),
         logoUrl,
       });
       await bot.telegram.sendPhoto(ctx.chat!.id, { source: card });
