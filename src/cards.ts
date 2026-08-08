@@ -70,6 +70,18 @@ function fmtUsd(n: number): string {
   return `${sign}$${abs.toFixed(2)}`;
 }
 
+// ── Duration formatter — used for "time held" on the milestone card ──
+function fmtDuration(minutes: number): string {
+  const m = Math.max(0, Math.floor(minutes));
+  if (m < 60) return `${m}m`;
+  const hours = Math.floor(m / 60);
+  const remMins = m % 60;
+  if (hours < 24) return `${hours}h ${remMins}m`;
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return `${days}d ${remHours}h`;
+}
+
 async function tryLoadLogo(url?: string): Promise<Image | null> {
   if (!url) return null;
   try {
@@ -231,6 +243,7 @@ export interface MilestoneCardParams {
   alertMcap: number;
   peakMcap: number;
   pnlPct: number;
+  heldMinutes: number;
   logoUrl?: string;
 }
 
@@ -259,6 +272,7 @@ export async function renderMilestoneCard(p: MilestoneCardParams): Promise<Buffe
   const stats = [
     { label: 'Alert MC', value: fmtUsd(p.alertMcap) },
     { label: 'Peak MC', value: fmtUsd(p.peakMcap) },
+    { label: 'Time Held', value: fmtDuration(p.heldMinutes) },
   ];
   drawStatGrid(ctx, stats, 500);
 
@@ -270,10 +284,49 @@ export async function renderMilestoneCard(p: MilestoneCardParams): Promise<Buffe
 export interface RecapCardParams {
   botName: string;
   periodTitle: string;
+  dateLine: string;
   heroTicker: string;
   heroMultiple: number;
   gainers: { ticker: string; multiple: number }[];
   statsLine?: string;
+}
+
+// ── Lays out every token in `gainers` inside the given box, growing the
+// column count and shrinking row height/font as needed so the full list
+// fits instead of silently truncating to a fixed top-N. ──
+function drawGainersGrid( ctx: any, gainers: { ticker: string; multiple: number }[], x: number, y: number, width: number, height: number ) {
+  if (gainers.length === 0) return;
+
+  const MIN_ROW_H = 22;
+  const MAX_ROW_H = 38;
+  const MAX_COLS = 4;
+
+  let cols = 1;
+  let rows = gainers.length;
+  let rowH = height / rows;
+  while (rowH < MIN_ROW_H && cols < MAX_COLS) {
+    cols++;
+    rows = Math.ceil(gainers.length / cols);
+    rowH = height / rows;
+  }
+  rowH = Math.max(MIN_ROW_H, Math.min(MAX_ROW_H, rowH));
+  const colWidth = width / cols;
+  const fontSize = Math.max(14, Math.min(24, Math.floor(rowH - 8)));
+
+  gainers.forEach((item, i) => {
+    const col = Math.floor(i / rows);
+    const row = i % rows;
+    const px = x + col * colWidth;
+    const py = y + row * rowH;
+
+    ctx.font = font(fontSize);
+    ctx.fillStyle = TEXT_PRIMARY;
+    ctx.fillText(`${i + 1}. $${item.ticker}`, px, py);
+    ctx.fillStyle = GREEN;
+    ctx.textAlign = 'right';
+    ctx.fillText(`${item.multiple.toFixed(1)}x`, px + colWidth - 16, py);
+    ctx.textAlign = 'left';
+  });
 }
 
 export async function renderRecapCard(p: RecapCardParams): Promise<Buffer> {
@@ -284,42 +337,39 @@ export async function renderRecapCard(p: RecapCardParams): Promise<Buffer> {
   drawBackground(ctx, accent);
   drawHeader(ctx, p.botName, p.periodTitle.toUpperCase(), accent);
 
-  // Hero stat, left
-  ctx.font = font(24);
-  ctx.fillStyle = TEXT_MUTED;
-  ctx.fillText('BIGGEST WINNER', 56, 150);
-
-  ctx.font = font(60);
-  ctx.fillStyle = TEXT_PRIMARY;
-  ctx.fillText(`$${p.heroTicker}`, 56, 185);
-
-  ctx.font = font(90);
-  ctx.fillStyle = accent;
-  ctx.fillText(`${p.heroMultiple.toFixed(1)}X`, 56, 250);
-
-  // Gainers list, top right — up to 10
-  const listX = 640;
-  let listY = 150;
+  // Date range, under the header
   ctx.font = font(20);
   ctx.fillStyle = TEXT_MUTED;
-  ctx.fillText('TOP GAINERS', listX, listY);
-  listY += 38;
+  ctx.fillText(p.dateLine, 56, 118);
 
-  p.gainers.slice(0, 10).forEach((item, i) => {
-    ctx.font = font(24);
-    ctx.fillStyle = TEXT_PRIMARY;
-    ctx.fillText(`${i + 1}. $${item.ticker}`, listX, listY);
-    ctx.fillStyle = GREEN;
-    ctx.textAlign = 'right';
-    ctx.fillText(`${item.multiple.toFixed(1)}x`, WIDTH - 56, listY);
-    ctx.textAlign = 'left';
-    listY += 36;
-  });
+  // Hero stat, left
+  ctx.font = font(22);
+  ctx.fillStyle = TEXT_MUTED;
+  ctx.fillText('BIGGEST WINNER', 56, 156);
+
+  ctx.font = font(52);
+  ctx.fillStyle = TEXT_PRIMARY;
+  ctx.fillText(`$${p.heroTicker}`, 56, 188);
+
+  ctx.font = font(76);
+  ctx.fillStyle = accent;
+  ctx.fillText(`${p.heroMultiple.toFixed(1)}X`, 56, 246);
+
+  // Gainers list — full width below the hero, sized to fit every token
+  const listX = 56;
+  let listY = 322;
+  ctx.font = font(20);
+  ctx.fillStyle = TEXT_MUTED;
+  ctx.fillText(`TOP GAINERS (${p.gainers.length})`, listX, listY);
+  listY += 32;
+
+  const listBottom = HEIGHT - (p.statsLine ? 96 : 56);
+  drawGainersGrid(ctx, p.gainers, listX, listY, WIDTH - 112, listBottom - listY);
 
   if (p.statsLine) {
     ctx.font = font(24);
     ctx.fillStyle = TEXT_MUTED;
-    ctx.fillText(p.statsLine, 56, HEIGHT - 70);
+    ctx.fillText(p.statsLine, 56, HEIGHT - 56);
   }
 
   return canvas.toBuffer('image/png');
