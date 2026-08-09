@@ -436,7 +436,20 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   return { price: 0, mcap: 0 };
 }
 
+// ── BUG FIX: same overlap risk as scan() — if tracked addresses grow, a
+// monitorPositions() run can outlast its 30s interval. An overlapping run
+// reads a stale `rec` before the first run's setAlert() finishes writing,
+// so a milestone hit gets computed twice and the later write clobbers the
+// earlier one, silently dropping the milestone card / peak update. ──
+let monitorInProgress = false;
+
 async function monitorPositions() {
+  if (monitorInProgress) {
+    console.log('⏭ Skipping monitorPositions — previous run still in progress');
+    return;
+  }
+  monitorInProgress = true;
+  try {
   const now = Date.now();
   const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
@@ -702,6 +715,9 @@ async function monitorPositions() {
   }));
 
   await saveHistory();
+  } finally {
+    monitorInProgress = false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -849,7 +865,19 @@ function scheduleMonthly(fn: () => void, hourUTC: number): void {
   safeSetTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
 }
 
+// ── BUG FIX: scan() routinely takes longer than the 60s interval (rate-limit
+// delays + network latency across up to 40 tokens). Without a guard, setInterval
+// fires a new scan() while the previous one is still running — two overlapping
+// runs can race on alertHistory reads/writes and silently drop a token's record.
+// This flag makes overlapping runs a no-op instead of a race. ──
+let scanInProgress = false;
+
 async function scan() {
+  if (scanInProgress) {
+    console.log('⏭ Skipping scan — previous scan still in progress');
+    return;
+  }
+  scanInProgress = true;
   console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
@@ -955,7 +983,7 @@ async function scan() {
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 70000) continue;
 
-        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+        // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
           if (ageMinutes < 45) {
@@ -963,6 +991,14 @@ async function scan() {
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
           }
+        }
+
+        // ── Volume filter — skip tokens under $150k in 24h volume ──
+        const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : 0;
+        if (volume24h < 150000) {
+          console.log(`⏭ ${ticker} volume too low: $${volume24h.toFixed(0)}, skipping`);
+          // ── Soft skip — do NOT add to seenTokens ──
+          continue;
         }
 
         const rugProb = computeRugProbability(mcap, liquidity);
@@ -1128,6 +1164,8 @@ async function scan() {
     console.log('⏭️ Robinhood scans disabled (temporarily off in code)');
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
+  } finally {
+    scanInProgress = false;
   }
 }
 
