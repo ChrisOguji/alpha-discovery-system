@@ -11,7 +11,7 @@ export interface BotSettings {
 }
 
 export const DEFAULT_SETTINGS: BotSettings = {
-  tradeSizeSol: 0.15,
+  tradeSizeSol: 0.02,
   takeProfitPct: 50,
   stopLossPct: 35,
   delayedEntryEnabled: false,

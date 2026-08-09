@@ -205,12 +205,7 @@ async function loadHistory() {
 
   // ✅ Supabase fallback
   try {
-    const result = await db.query(`
-      SELECT address, ticker, alert_time, alert_mcap, alert_price,
-             peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-             exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
-      FROM alert_history ORDER BY alert_time DESC LIMIT 500
-    `);
+    const result = await db.query(` SELECT address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit FROM alert_history ORDER BY alert_time DESC LIMIT 500 `);
     for (const row of result.rows) {
       alertHistory.set(row.address, {
         ticker: row.ticker,
@@ -257,26 +252,7 @@ async function saveHistory() {
       continue;
     }
     try {
-      await db.query(`
-        INSERT INTO alert_history (
-          address, ticker, alert_time, alert_mcap, alert_price,
-          peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated,
-          exit_reason, exit_price, exit_mcap, exit_time, milestones_hit
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-        ON CONFLICT (address) DO UPDATE SET
-          peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap),
-          peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price),
-          peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price
-                     THEN EXCLUDED.peak_time ELSE alert_history.peak_time END,
-          current_mcap = EXCLUDED.current_mcap,
-          current_price = EXCLUDED.current_price,
-          last_updated = EXCLUDED.last_updated,
-          exit_reason = EXCLUDED.exit_reason,
-          exit_price = EXCLUDED.exit_price,
-          exit_mcap = EXCLUDED.exit_mcap,
-          exit_time = EXCLUDED.exit_time,
-          milestones_hit = EXCLUDED.milestones_hit
-      `, [
+      await db.query(` INSERT INTO alert_history ( address, ticker, alert_time, alert_mcap, alert_price, peak_mcap, peak_price, peak_time, current_mcap, current_price, last_updated, exit_reason, exit_price, exit_mcap, exit_time, milestones_hit ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) ON CONFLICT (address) DO UPDATE SET peak_mcap = GREATEST(alert_history.peak_mcap, EXCLUDED.peak_mcap), peak_price = GREATEST(alert_history.peak_price, EXCLUDED.peak_price), peak_time = CASE WHEN EXCLUDED.peak_price > alert_history.peak_price THEN EXCLUDED.peak_time ELSE alert_history.peak_time END, current_mcap = EXCLUDED.current_mcap, current_price = EXCLUDED.current_price, last_updated = EXCLUDED.last_updated, exit_reason = EXCLUDED.exit_reason, exit_price = EXCLUDED.exit_price, exit_mcap = EXCLUDED.exit_mcap, exit_time = EXCLUDED.exit_time, milestones_hit = EXCLUDED.milestones_hit `, [
         rec.address, rec.ticker, rec.alertTime, rec.alertMcap, rec.alertPrice,
         rec.peakMcap, rec.peakPrice, rec.peakTime, rec.currentMcap, rec.currentPrice, rec.lastUpdated,
         rec.exitReason || null, rec.exitPrice ?? null, rec.exitMcap ?? null, rec.exitTime ?? null,
@@ -307,7 +283,7 @@ function computeAlphaScore(mcap: number, liquidity: number, rugProb: number): nu
   else if (ratio >= 0.20) score += 30;
   else if (ratio >= 0.10) score += 20;
   else if (ratio >= 0.05) score += 10;
-  if (mcap >= 1000 && mcap <= 40000) score += 25;
+  if (mcap >= 1000 && mcap <= 50000) score += 25;
 
   // ── Liquidity scoring: ratio bonus for $10k–$17k range, raw otherwise ──
   if (mcap >= 10000 && mcap <= 17000) {
@@ -333,6 +309,51 @@ function computeRugProbability(mcap: number, liquidity: number): number {
   if (ratio < 0.20) return 0.25;
   if (mcap < 5000) return 0.35;
   return 0.12;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lore/story-strength scoring — some tokens have a genuine, specific,
+// shareable narrative (real people, real events, a distinct concept)
+// instead of generic copy-paste PvP-relaunch language. That's a real
+// signal worth boosting, but judging it is a language task, not something
+// a keyword list can do reliably. Two-stage approach: a free heuristic
+// filters out anything too short/empty to even be a real story, THEN an
+// AI call judges only the survivors — keeps API usage cheap and bounded.
+// ─────────────────────────────────────────────────────────────────────────
+
+function hasLorePotential(description: string | undefined): boolean {
+  if (!description) return false;
+  const trimmed = description.trim();
+  if (trimmed.length < 60) return false; // too short to be a real story
+  const wordCount = trimmed.split(/\s+/).length;
+  return wordCount >= 12;
+}
+
+async function scoreLoreWithAI(ticker: string, description: string): Promise<number> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return 0;
+  try {
+    const res = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 10,
+      messages: [{
+        role: 'user',
+        content: `Rate how compelling and shareable this crypto token's story/lore is, on a scale of 0-100. A high score means a genuine, specific, unique narrative (real people, real events, a distinct concept) that could realistically go viral. A low score means generic, vague, templated, or copy-paste marketing language with no real story.\n\nToken: $${ticker}\nDescription: "${description}"\n\nRespond with ONLY a number from 0 to 100, nothing else.`
+      }]
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 8000
+    });
+    const text = res.data?.choices?.[0]?.message?.content?.trim() || '0';
+    const score = parseInt(text, 10);
+    return isNaN(score) ? 0 : Math.min(100, Math.max(0, score));
+  } catch (e: any) {
+    console.log(`⚠️ Lore scoring failed for ${ticker}: ${e.message}`);
+    return 0;
+  }
 }
 
 function isReversalCandidate(pair: any): boolean {
@@ -415,7 +436,20 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   return { price: 0, mcap: 0 };
 }
 
+// ── BUG FIX: same overlap risk as scan() — if tracked addresses grow, a
+// monitorPositions() run can outlast its 30s interval. An overlapping run
+// reads a stale `rec` before the first run's setAlert() finishes writing,
+// so a milestone hit gets computed twice and the later write clobbers the
+// earlier one, silently dropping the milestone card / peak update. ──
+let monitorInProgress = false;
+
 async function monitorPositions() {
+  if (monitorInProgress) {
+    console.log('⏭ Skipping monitorPositions — previous run still in progress');
+    return;
+  }
+  monitorInProgress = true;
+  try {
   const now = Date.now();
   const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
@@ -515,6 +549,7 @@ async function monitorPositions() {
                   alertMcap: rec.alertMcap,
                   peakMcap: updated.peakMcap,
                   pnlPct: ((updated.peakPrice - rec.alertPrice) / rec.alertPrice) * 100,
+                  heldMinutes: Math.floor((now - rec.alertTime) / 60000),
                   logoUrl,
                 });
                 await bot.telegram.sendPhoto(CHAT_ID, { source: card });
@@ -543,6 +578,24 @@ async function monitorPositions() {
         // ── TAKE PROFIT ──
         if (pnlPct >= tp) {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
+
+          // ── Actually sell the position on-chain before treating it as
+          // closed — this is the fix for the bug where TP/SL only updated
+          // tracking and never sold anything for real. ──
+          let sellResult: { success: boolean; signature?: string; error?: string };
+          try {
+            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
+            sellTx.sign([executor.getWalletKeypair()]);
+            sellResult = await executor.executeSwap(sellTx);
+          } catch (e: any) {
+            sellResult = { success: false, error: e.message };
+          }
+
+          if (!sellResult.success) {
+            console.log(`❌ TP sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            return;
+          }
+
           const solUsd = await getSolUsd();
           const rec = alertHistory.get(address);
           try {
@@ -578,7 +631,7 @@ async function monitorPositions() {
             await saveHistory();
           }
           openPositions.delete(address);
-          console.log(`✅ TP hit: ${pos.ticker} +${pnlPct.toFixed(1)}%`);
+          console.log(`✅ TP hit + sold: ${pos.ticker} +${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           return;
         }
 
@@ -587,6 +640,25 @@ async function monitorPositions() {
           const pnlSol = pos.sizeSol * (pnlPct / 100);
           const peakGainPct = ((pos.peakPrice - pos.entryPrice) / pos.entryPrice) * 100;
           const everPumped = peakGainPct >= 40;
+
+          // ── Actually sell the position on-chain before treating it as
+          // closed — same fix as the TP side. This happens regardless of
+          // whether the card below gets announced, since the real money
+          // needs to be closed either way. ──
+          let sellResult: { success: boolean; signature?: string; error?: string };
+          try {
+            const sellTx = await executor.buildJupiterSellTransaction(address, botSettings.slippageBps);
+            sellTx.sign([executor.getWalletKeypair()]);
+            sellResult = await executor.executeSwap(sellTx);
+          } catch (e: any) {
+            sellResult = { success: false, error: e.message };
+          }
+
+          if (!sellResult.success) {
+            console.log(`❌ SL sell failed for ${pos.ticker}, keeping position open to retry next cycle: ${sellResult.error}`);
+            return;
+          }
+
           const rec = alertHistory.get(address);
 
           // ── Finding 7: persist the exit before mutating in-memory state, so a crash never loses the trade ──
@@ -628,9 +700,9 @@ async function monitorPositions() {
             } catch (e: any) {
               console.log(`⚠️ Failed to send SL card: ${e.message}`);
             }
-            console.log(`✅ SL hit (announced): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+            console.log(`✅ SL hit + sold (announced): ${pos.ticker} ${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           } else {
-            console.log(`✅ SL hit (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}%`);
+            console.log(`✅ SL hit + sold (silent — peaked +${peakGainPct.toFixed(0)}% first): ${pos.ticker} ${pnlPct.toFixed(1)}% — tx: ${sellResult.signature}`);
           }
           return;
         }
@@ -643,6 +715,9 @@ async function monitorPositions() {
   }));
 
   await saveHistory();
+  } finally {
+    monitorInProgress = false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -655,18 +730,29 @@ function gainMultiple(rec: AlertRecord): number {
   return rec.alertPrice > 0 ? rec.peakPrice / rec.alertPrice : 0;
 }
 
+// ── Human-readable date/date-range for the recap cards ──
+function formatCardDateLine(windowMs: number): string {
+  const fmt = (d: Date) => d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  const end = new Date();
+  if (windowMs <= 24 * 60 * 60 * 1000) return fmt(end);
+  const start = new Date(Date.now() - windowMs);
+  return `${fmt(start)} - ${fmt(end)}`;
+}
+
 async function postTopGainers(windowMs: number, title: string): Promise<void> {
   const cutoff = Date.now() - windowMs;
   const inWindow = Array.from(alertHistory.values()).filter(r => r.alertTime >= cutoff && r.alertPrice > 0);
   if (inWindow.length === 0) return;
 
-  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
+  // ── Show every token from the window on the card, not just a top-10 slice ──
+  const ranked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a));
   const hero = ranked[0];
 
   try {
     const card = await renderRecapCard({
       botName: DENGINE_NAME,
       periodTitle: `Top Gainers — ${title}`,
+      dateLine: formatCardDateLine(windowMs),
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: ranked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
@@ -689,7 +775,8 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
   const wins = inWindow.filter(r => gainMultiple(r) >= 1.4).length;
   const losses = inWindow.filter(r => gainMultiple(r) < 1.3).length;
 
-  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a)).slice(0, 10);
+  // ── Show every token from the window on the card, not just a top-10 slice ──
+  const gainersRanked = [...inWindow].sort((a, b) => gainMultiple(b) - gainMultiple(a));
   const hero = gainersRanked[0];
   if (!hero) return;
 
@@ -697,6 +784,7 @@ async function postRecap(windowMs: number, periodTitle: string): Promise<void> {
     const card = await renderRecapCard({
       botName: DENGINE_NAME,
       periodTitle,
+      dateLine: formatCardDateLine(windowMs),
       heroTicker: hero.ticker,
       heroMultiple: gainMultiple(hero),
       gainers: gainersRanked.map(r => ({ ticker: r.ticker, multiple: gainMultiple(r) })),
@@ -777,7 +865,19 @@ function scheduleMonthly(fn: () => void, hourUTC: number): void {
   safeSetTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
 }
 
+// ── BUG FIX: scan() routinely takes longer than the 60s interval (rate-limit
+// delays + network latency across up to 40 tokens). Without a guard, setInterval
+// fires a new scan() while the previous one is still running — two overlapping
+// runs can race on alertHistory reads/writes and silently drop a token's record.
+// This flag makes overlapping runs a no-op instead of a race. ──
+let scanInProgress = false;
+
 async function scan() {
+  if (scanInProgress) {
+    console.log('⏭ Skipping scan — previous scan still in progress');
+    return;
+  }
+  scanInProgress = true;
   console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
@@ -785,7 +885,7 @@ async function scan() {
     const profiles = profilesRes.data || [];
     const pumpProfiles = profiles
       .filter((p: any) => typeof p.tokenAddress === 'string' && p.tokenAddress.endsWith('pump'))
-      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles' }));
+      .map((p: any) => ({ tokenAddress: p.tokenAddress, source: 'profiles', description: p.description }));
 
     let pumpSwapProfiles: any[] = [];
     try {
@@ -825,7 +925,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 5000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 26000
+          parseFloat(p.fdv || p.marketCap || '0') <= 70000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -869,26 +969,52 @@ async function scan() {
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
         if (!mcap) { markSeen(p.tokenAddress); continue; }
 
+        // ── Duplicate-alert fix: seenTokens is a 500-entry FIFO cache that
+        // can evict an address well before it's actually done being tracked,
+        // letting it re-qualify and get alerted (and spammed to Telegram) a
+        // second time. alertHistory is the durable, DB-backed source of
+        // truth for "has this token already been alerted" — check that too. ──
+        if (alertHistory.has(address)) { markSeen(p.tokenAddress); continue; }
+
         const isNew = p.source === 'pumpfun-new' || p.source === 'dex-new';
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 5000 : 10000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 26000) continue;
+        if (mcap < mcapMin || mcap > 70000) continue;
 
-        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+        // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 40) {
+          if (ageMinutes < 45) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
           }
         }
 
+        // ── Volume filter — skip tokens under $150k in 24h volume ──
+        const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : 0;
+        if (volume24h < 100000) {
+          console.log(`⏭ ${ticker} volume too low: $${volume24h.toFixed(0)}, skipping`);
+          // ── Soft skip — do NOT add to seenTokens ──
+          continue;
+        }
+
         const rugProb = computeRugProbability(mcap, liquidity);
-        const alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
+        let alphaScore = computeAlphaScore(mcap, liquidity, rugProb);
         const scoreMin = isNew ? 70 : 75;
+
+        // ── Lore bonus: only tokens with an actual profile description
+        // (currently just the 'profiles' source) are eligible, and only
+        // ones that already pass the free heuristic filter get the AI call ──
+        if (p.description && hasLorePotential(p.description)) {
+          const loreScore = await scoreLoreWithAI(ticker, p.description);
+          if (loreScore >= 70) {
+            alphaScore = Math.min(100, alphaScore + 15);
+            console.log(`📖 Strong lore detected: ${ticker} (lore score ${loreScore}/100) — +15 alpha boost`);
+          }
+        }
 
         console.log(`[${p.source}] ${ticker}: MCAP $${mcap} | Liq $${liquidity} | Score ${alphaScore}/100`);
 
@@ -1038,6 +1164,8 @@ async function scan() {
     console.log('⏭️ Robinhood scans disabled (temporarily off in code)');
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
+  } finally {
+    scanInProgress = false;
   }
 }
 
@@ -1047,25 +1175,7 @@ async function init() {
 
   // ✅ Create alert_history table if not exists
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS alert_history (
-        address TEXT PRIMARY KEY,
-        ticker TEXT,
-        alert_time BIGINT,
-        alert_mcap NUMERIC,
-        alert_price NUMERIC,
-        peak_mcap NUMERIC,
-        peak_price NUMERIC,
-        peak_time BIGINT,
-        current_mcap NUMERIC,
-        current_price NUMERIC,
-        last_updated BIGINT,
-        exit_reason TEXT,
-        exit_price NUMERIC,
-        exit_mcap NUMERIC,
-        exit_time BIGINT
-      );
-    `);
+    await db.query(` CREATE TABLE IF NOT EXISTS alert_history ( address TEXT PRIMARY KEY, ticker TEXT, alert_time BIGINT, alert_mcap NUMERIC, alert_price NUMERIC, peak_mcap NUMERIC, peak_price NUMERIC, peak_time BIGINT, current_mcap NUMERIC, current_price NUMERIC, last_updated BIGINT, exit_reason TEXT, exit_price NUMERIC, exit_mcap NUMERIC, exit_time BIGINT ); `);
     // ── Finding 1: backfill exit columns on tables created before this fix ──
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_reason TEXT`);
     await db.query(`ALTER TABLE alert_history ADD COLUMN IF NOT EXISTS exit_price NUMERIC`);
@@ -1110,7 +1220,7 @@ bot.launch({
   // Robinhood Chain temporarily disabled — re-enable by uncommenting the import
   // at the top of this file and restoring this block.
   // if (botSettings.robinhoodEnabled) {
-  //   startPonsFactoryListener();
+  // startPonsFactoryListener();
   // }
   scan();
   setInterval(scan, 60000);
@@ -1140,9 +1250,9 @@ bot.command('positions', async (ctx) => {
   for (const [address, pos] of openPositions.entries()) {
     const mins = Math.floor((Date.now() - pos.entryTime) / 60000);
     lines.push(`• $${escapeText(pos.ticker)} — ${pos.sizeSol} SOL — ${mins}m held`);
-    lines.push(`  Entry: $${pos.entryPrice.toFixed(8)}`);
-    lines.push(`  Peak: $${pos.peakPrice.toFixed(8)}`);
-    lines.push(`  Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
+    lines.push(` Entry: $${pos.entryPrice.toFixed(8)}`);
+    lines.push(` Peak: $${pos.peakPrice.toFixed(8)}`);
+    lines.push(` Stop Loss: -${botSettings.stopLossPct}% | Take Profit: +${botSettings.takeProfitPct}%`);
     lines.push('');
   }
   if (pendingEntries.size > 0) {
@@ -1202,10 +1312,13 @@ if (period === 'daily') {
 } else {
   cutoff = 0;
 }
+  // ── Show every token in the period — only capped at 100, which is
+  // Telegram's actual hard limit on inline keyboard buttons, not an
+  // arbitrary product limit. ──
   const filtered = Array.from(alertHistory.entries())
     .filter(([, rec]) => rec.alertTime >= cutoff)
     .sort((a, b) => b[1].alertTime - a[1].alertTime)
-    .slice(0, 20);
+    .slice(0, 100);
 
   const periodLabel: Record<string, string> = {
     daily: '📅 Daily', weekly: '📆 Weekly',
