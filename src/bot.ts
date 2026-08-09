@@ -14,7 +14,7 @@ import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
 import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
-
+console.log("🟢 BUILD VERSION: " + new Date().toISOString());
 const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
