@@ -897,7 +897,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 5000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 50000
+          parseFloat(p.fdv || p.marketCap || '0') <= 70000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -937,10 +937,6 @@ async function scan() {
         const address = pair?.baseToken?.address || p.tokenAddress;
         const creatorAddress = pair?.info?.deployer || undefined;
         const currentPrice = parseFloat(pair?.priceUsd || '0');
-        // ── Volume threshold: 24h volume, when available from DexScreener.
-        // null (not 0) when there's no pair data yet — e.g. brand-new WSS
-        // pump.fun tokens — so the check below doesn't wrongly reject them. ──
-        const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : null;
 
         if (!liquidity && mcap > 0) liquidity = mcap * 0.15;
         if (!mcap) { markSeen(p.tokenAddress); continue; }
@@ -959,18 +955,10 @@ async function scan() {
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 70000) continue;
 
-        // ── Volume threshold: reject tokens with confirmed 24h volume under
-        // $200k. Skipped (not rejected) when volume24h is null, since that
-        // just means no pair data was available yet, not that volume is low. ──
-        if (volume24h !== null && volume24h < 200000) {
-          console.log(`⏭ ${ticker} volume too low: $${volume24h.toLocaleString('en-US')}, skipping`);
-          continue;
-        }
-
         // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
           const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 51) {
+          if (ageMinutes < 45) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
