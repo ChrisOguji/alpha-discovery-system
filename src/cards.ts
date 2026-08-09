@@ -389,7 +389,6 @@ export interface CallResultCardParams {
   peakPct: number;
   multiple: number;
   neverPumped: boolean;
-  peakMinutes: number;
   logoUrl?: string;
 }
 
@@ -427,7 +426,6 @@ export async function renderCallResultCard(p: CallResultCardParams): Promise<Buf
   const stats = [
     { label: 'Alert MC', value: fmtUsd(p.alertMcap) },
     { label: 'Peak MC', value: fmtUsd(p.peakMcap) },
-    { label: 'Time to Peak', value: fmtDuration(p.peakMinutes) },
   ];
   drawStatGrid(ctx, stats, p.neverPumped ? 460 : 500);
 
