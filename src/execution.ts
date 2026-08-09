@@ -45,7 +45,10 @@ const BUY_DISCRIMINATOR  = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 const SELL_DISCRIMINATOR = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
 
 export class LowLatencyExecutionEngine {
-  private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://quote-api.jup.ag/v6';
+  // Default to Jupiter's current lite-api endpoint. The old quote-api.jup.ag/v6
+  // has been deprecated and can return quotes that build txs referencing stale
+  // routes, which leaders silently reject — producing signatures that never land.
+  private jupiterUrl = process.env.QUICKNODE_JUPITER_URL || 'https://lite-api.jup.ag/swap/v1';
   private wallet: Keypair | null = null;
 
   // ── RPC failover state ──
@@ -488,12 +491,17 @@ export class LowLatencyExecutionEngine {
   }
 
   // ── One sendTransaction across the failover RPC pool. ──
+  // Preflight is skipped by default for speed. Set DEBUG_PREFLIGHT=true in
+  // env to enable it — the RPC will then surface any pre-execution errors
+  // (bad instruction, missing account, stale route, etc.) that are otherwise
+  // silently swallowed and cause the tx to appear to send but never land.
   private async sendRaw(encodedTx: string): Promise<string | null> {
+    const skipPreflight = process.env.DEBUG_PREFLIGHT !== 'true';
     const out = await this.rpc('sendTransaction', [
       encodedTx,
       {
         encoding: 'base64',
-        skipPreflight: true,
+        skipPreflight,
         maxRetries: MAX_RPC_RETRIES,
         preflightCommitment: 'processed',
       },
@@ -552,8 +560,45 @@ export class LowLatencyExecutionEngine {
       return { success: true, signature: first };
     }
 
+    // ── Reconciliation: the confirmation loop timed out at ~50s, but the
+    // background blast is still trying. Give it a brief grace window, then
+    // do one authoritative status lookup with searchTransactionHistory=true
+    // before declaring failure. Prevents false negatives where the tx lands
+    // at second 51+ and the bot incorrectly reports "not confirmed" while
+    // real funds have moved on-chain. ──
+    await new Promise(r => setTimeout(r, 5000));
+    const finalStatus = await this.finalStatusCheck(first);
+    if (finalStatus === 'confirmed') {
+      console.log(`\u2705 Tx confirmed on-chain (late land): ${first}`);
+      return { success: true, signature: first };
+    }
+    if (finalStatus === 'failed') {
+      console.log(`\u274c Tx failed on-chain: https://solscan.io/tx/${first}`);
+      return { success: false, signature: first, error: 'Transaction failed on-chain' };
+    }
+
     console.log(`\u26a0\ufe0f Tx not confirmed in time \u2014 treating as failed: https://solscan.io/tx/${first}`);
     return { success: false, signature: first, error: 'Transaction not confirmed on-chain within timeout' };
+  }
+
+  // ── Authoritative "did this tx land?" check using signature history.
+  // Returns 'confirmed' if landed successfully, 'failed' if landed with
+  // an on-chain error, or 'unknown' if the tx is genuinely not on chain
+  // (dropped by leaders, silently rejected, or still pending). ──
+  private async finalStatusCheck(signature: string): Promise<'confirmed' | 'failed' | 'unknown'> {
+    try {
+      const out = await this.rpc('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]);
+      const status = out.result?.value?.[0];
+      if (!status) return 'unknown';
+      if (status.err) return 'failed';
+      if (status.confirmationStatus === 'confirmed' ||
+          status.confirmationStatus === 'finalized') {
+        return 'confirmed';
+      }
+      return 'unknown';
+    } catch {
+      return 'unknown';
+    }
   }
 
   // ── Single status check across the failover RPC pool. ──
