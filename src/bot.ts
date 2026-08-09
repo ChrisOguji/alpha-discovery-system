@@ -995,7 +995,7 @@ async function scan() {
 
         // ── Volume filter — skip tokens under $150k in 24h volume ──
         const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : 0;
-        if (volume24h < 100000) {
+        if (volume24h < 150000) {
           console.log(`⏭ ${ticker} volume too low: $${volume24h.toFixed(0)}, skipping`);
           // ── Soft skip — do NOT add to seenTokens ──
           continue;
