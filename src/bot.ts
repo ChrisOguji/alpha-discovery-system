@@ -1038,6 +1038,23 @@ async function scan() {
           continue;
         }
 
+        // ── Cross-instance dedup — Railway can briefly run two containers during a
+        // redeploy (old one draining while the new one starts), and each has its own
+        // in-memory alertHistory/seenTokens. Those alone can't stop both instances from
+        // alerting (and auto-buying) the same token in that overlap window, so claim it
+        // atomically in Redis right before acting — only the instance that wins proceeds. ──
+        let claimed: string | null = 'OK';
+        try {
+          claimed = await redis.set(`alert_claim:${address}`, '1', 'EX', 3600, 'NX');
+        } catch (e: any) {
+          console.log(`⚠️ Redis claim check failed, proceeding without dedup lock: ${e.message}`);
+        }
+        if (claimed === null) {
+          console.log(`⏭ ${ticker} already claimed by another instance — skipping`);
+          markSeen(p.tokenAddress);
+          continue;
+        }
+
         const h24 = pair ? parseFloat(pair.priceChange?.h24 || '0') : 0;
         const h1 = pair ? parseFloat(pair.priceChange?.h1 || '0') : 0;
 
