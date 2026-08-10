@@ -14,7 +14,7 @@ import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
 import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
-console.log("🟢 BUILD VERSION: " + new Date().toISOString());
+
 const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
@@ -436,20 +436,7 @@ async function getLivePrice(address: string): Promise<{ price: number; mcap: num
   return { price: 0, mcap: 0 };
 }
 
-// ── BUG FIX: same overlap risk as scan() — if tracked addresses grow, a
-// monitorPositions() run can outlast its 30s interval. An overlapping run
-// reads a stale `rec` before the first run's setAlert() finishes writing,
-// so a milestone hit gets computed twice and the later write clobbers the
-// earlier one, silently dropping the milestone card / peak update. ──
-let monitorInProgress = false;
-
 async function monitorPositions() {
-  if (monitorInProgress) {
-    console.log('⏭ Skipping monitorPositions — previous run still in progress');
-    return;
-  }
-  monitorInProgress = true;
-  try {
   const now = Date.now();
   const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000;
 
@@ -715,9 +702,6 @@ async function monitorPositions() {
   }));
 
   await saveHistory();
-  } finally {
-    monitorInProgress = false;
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -865,19 +849,7 @@ function scheduleMonthly(fn: () => void, hourUTC: number): void {
   safeSetTimeout(runAndReschedule, firstRun.getTime() - now.getTime());
 }
 
-// ── BUG FIX: scan() routinely takes longer than the 60s interval (rate-limit
-// delays + network latency across up to 40 tokens). Without a guard, setInterval
-// fires a new scan() while the previous one is still running — two overlapping
-// runs can race on alertHistory reads/writes and silently drop a token's record.
-// This flag makes overlapping runs a no-op instead of a race. ──
-let scanInProgress = false;
-
 async function scan() {
-  if (scanInProgress) {
-    console.log('⏭ Skipping scan — previous scan still in progress');
-    return;
-  }
-  scanInProgress = true;
   console.log("🔍 Scanning pump.fun + PumpSwap + Early Detection + Reversals...");
   try {
 
@@ -925,7 +897,7 @@ async function scan() {
           p.chainId === 'solana' &&
           isReversalCandidate(p) &&
           parseFloat(p.fdv || p.marketCap || '0') >= 5000 &&
-          parseFloat(p.fdv || p.marketCap || '0') <= 70000
+          parseFloat(p.fdv || p.marketCap || '0') <= 50000
         )
         .map((p: any) => ({ tokenAddress: p.baseToken.address, source: 'reversal', cachedPair: p }));
       console.log(`Reversals: ${reversalTokens.length}`);
@@ -981,24 +953,16 @@ async function scan() {
         const mcapMin = isNew ? 5000 : 10000;
 
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
-        if (mcap < mcapMin || mcap > 70000) continue;
+        if (mcap < mcapMin || mcap > 50000) continue;
 
-        // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
-        const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
+        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
         if (!isNew && pair?.pairCreatedAt) {
-          if (ageMinutes < 45) {
+          const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
+          if (ageMinutes < 40) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
           }
-        }
-
-        // ── Volume filter — skip tokens under $150k in 24h volume ──
-        const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : 0;
-        if (volume24h < 150000) {
-          console.log(`⏭ ${ticker} volume too low: $${volume24h.toFixed(0)}, skipping`);
-          // ── Soft skip — do NOT add to seenTokens ──
-          continue;
         }
 
         const rugProb = computeRugProbability(mcap, liquidity);
@@ -1034,23 +998,6 @@ async function scan() {
 
         if (!pattern.passedPatterns) {
           console.log(`⏭ ${ticker} failed: ${pattern.reason}`);
-          markSeen(p.tokenAddress);
-          continue;
-        }
-
-        // ── Cross-instance dedup — Railway can briefly run two containers during a
-        // redeploy (old one draining while the new one starts), and each has its own
-        // in-memory alertHistory/seenTokens. Those alone can't stop both instances from
-        // alerting (and auto-buying) the same token in that overlap window, so claim it
-        // atomically in Redis right before acting — only the instance that wins proceeds. ──
-        let claimed: string | null = 'OK';
-        try {
-          claimed = await redis.set(`alert_claim:${address}`, '1', 'EX', 3600, 'NX');
-        } catch (e: any) {
-          console.log(`⚠️ Redis claim check failed, proceeding without dedup lock: ${e.message}`);
-        }
-        if (claimed === null) {
-          console.log(`⏭ ${ticker} already claimed by another instance — skipping`);
           markSeen(p.tokenAddress);
           continue;
         }
@@ -1147,8 +1094,6 @@ async function scan() {
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-          `*24h Volume:* $${volume24h.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
-          `*Age:* ${ageMinutes > 0 ? ageMinutes.toFixed(1) + ' mins' : 'N/A \\(new launch\\)'}`,
           `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
           ...reversalLine, ``,
           `🤖 *Execution State:*`,
@@ -1183,8 +1128,6 @@ async function scan() {
     console.log('⏭️ Robinhood scans disabled (temporarily off in code)');
   } catch (e: any) {
     console.error("Global Scan Error:", e.message);
-  } finally {
-    scanInProgress = false;
   }
 }
 
