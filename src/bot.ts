@@ -14,7 +14,7 @@ import Redis from 'ioredis';
 import { db, initDatabaseSchema } from './db';
 import { renderExitCard, renderMilestoneCard, renderRecapCard, renderCallResultCard } from './cards';
 // import { startPonsFactoryListener, runPonsScan, stopPonsFactoryListener } from './robinhood';
-
+console.log("🟢 BUILD VERSION: " + new Date().toISOString());
 const redis = new Redis(process.env.REDIS_URL || '');
 
 dotenv.config();
@@ -984,9 +984,9 @@ async function scan() {
         if (mcap < mcapMin || mcap > 70000) continue;
 
         // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
+        const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
         if (!isNew && pair?.pairCreatedAt) {
-          const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
-          if (ageMinutes < 45) {
+          if (ageMinutes < 40) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
@@ -995,7 +995,7 @@ async function scan() {
 
         // ── Volume filter — skip tokens under $150k in 24h volume ──
         const volume24h = pair ? parseFloat(pair.volume?.h24 || '0') : 0;
-        if (volume24h < 100000) {
+        if (volume24h < 150000) {
           console.log(`⏭ ${ticker} volume too low: $${volume24h.toFixed(0)}, skipping`);
           // ── Soft skip — do NOT add to seenTokens ──
           continue;
@@ -1147,6 +1147,8 @@ async function scan() {
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*24h Volume:* $${volume24h.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*Age:* ${ageMinutes > 0 ? ageMinutes.toFixed(1) + ' mins' : 'N/A \\(new launch\\)'}`,
           `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
           ...reversalLine, ``,
           `🤖 *Execution State:*`,
