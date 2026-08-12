@@ -955,9 +955,9 @@ async function scan() {
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 70000) continue;
 
-        // ── Number 4: Time-alive filter — skip tokens under 7 minutes old (non-WSS only) ──
+        // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
+        const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
         if (!isNew && pair?.pairCreatedAt) {
-          const ageMinutes = (Date.now() - pair.pairCreatedAt) / 60000;
           if (ageMinutes < 51) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
@@ -1094,6 +1094,8 @@ async function scan() {
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
           `*Liquidity:* $${liquidity.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*24h Volume:* $${volume24h.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
+          `*Age:* ${ageMinutes > 0 ? ageMinutes.toFixed(1) + ' mins' : 'N/A \\(new launch\\)'}`,
           `*Source:* ${sourceLabel[p.source] || '📈 Trending'}`,
           ...reversalLine, ``,
           `🤖 *Execution State:*`,
