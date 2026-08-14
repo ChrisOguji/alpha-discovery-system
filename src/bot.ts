@@ -952,9 +952,10 @@ async function scan() {
         const isReversal = p.source === 'reversal';
         const mcapMin = isNew ? 5000 : 10000;
 
+        const volume24h = parseFloat(pair?.volume?.h24 || '0');
         // ── FIX 1: Soft skips do NOT add to seenTokens — token stays eligible for re-scan ──
         if (mcap < mcapMin || mcap > 70000) continue;
-
+        
         // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
         const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
         if (!isNew && pair?.pairCreatedAt) {
