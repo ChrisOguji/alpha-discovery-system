@@ -958,7 +958,7 @@ async function scan() {
         // ── Time-alive filter — skip tokens under 45 minutes old (non-WSS only) ──
         const ageMinutes = pair?.pairCreatedAt ? (Date.now() - pair.pairCreatedAt) / 60000 : 0;
         if (!isNew && pair?.pairCreatedAt) {
-          if (ageMinutes < 51) {
+          if (ageMinutes < 50) {
             console.log(`⏭ ${ticker} too young: ${ageMinutes.toFixed(1)} mins old, skipping`);
             // ── FIX 1: Soft skip — do NOT add to seenTokens ──
             continue;
@@ -1089,7 +1089,7 @@ async function scan() {
           : [];
 
         const msg = [
-          `🚨🚨 *AUTONOMOUS AI DEGEN CALL* 🚨🚨`, ``,
+          `🚨🚨 *ONCHAIN ALPHA TRACKER* 🚨🚨`, ``,
           `*Token:* $${escapeText(ticker)}`,
           `*Address:* \`${address}\``,
           `*Market Cap:* 💰 $${mcap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`,
